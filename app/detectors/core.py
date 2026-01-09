@@ -590,10 +590,10 @@ async def detect_ai_media_image_logic(
     is_ai_likely = forensic_probability > 0.5
     logger.debug(f"[DEBUG] Prob: {forensic_probability}, LIKELY_AI: {ScoringConfig.THRESHOLDS['LIKELY_AI']}, POSSIBLE: {ScoringConfig.THRESHOLDS['POSSIBLE_AI']}")
     
-    if forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_AI"]: summary = "Likely AI (High Confidence)"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["POSSIBLE_AI"]: summary = "Possible AI (Forensic Match)"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["SUSPICIOUS_AI"]: summary = "Suspicious (Inconsistent Pixels)"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_HUMAN_NOISE"]: summary = "Likely Original (Minor Noise)"
+    if forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_AI"]: summary = "Likely AI"
+    elif forensic_probability > ScoringConfig.THRESHOLDS["POSSIBLE_AI"]: summary = "Possible AI"
+    elif forensic_probability > ScoringConfig.THRESHOLDS["SUSPICIOUS_AI"]: summary = "Uncertain / Suspicious"
+    elif forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_HUMAN_NOISE"]: summary = "Likely Original (Low Confidence)"
     else: summary = "Likely Original"
 
     logger.debug(f"[DEBUG] Summary chosen: {summary}")
@@ -601,6 +601,9 @@ async def detect_ai_media_image_logic(
     raw_conf = forensic_probability if is_ai_likely else (1.0 - forensic_probability)
     final_conf = boost_score(raw_conf, is_ai_likely=is_ai_likely)
     if final_conf > 0.99: final_conf = 0.99
+    
+    # Calculate G-Score for logging
+    g_score_log = round(forensic_probability, 2)
 
     final_result = {
         "summary": summary,
@@ -616,5 +619,15 @@ async def detect_ai_media_image_logic(
 
     if file_hash and not _benchmark_mode_enabled():
         forensic_cache.put(file_hash, final_result)
+        
+    # Log G-Score explicitly
+    try:
+        if "layers" in final_result and "layer1_metadata" in final_result["layers"]:
+            h_score = meta_summary.get("human_score", 0.0)
+            a_score = meta_summary.get("ai_score", 0.0)
+            logger.info(f"[DECISION] Verdict: {summary} ({final_conf:.2f}) | Source: Final Consensus | Scores: H={h_score}, A={a_score}, G={g_score_log}")
+            # Skip the helper _log_decision since we logged it manually with G-score
+            return final_result
+    except: pass
 
     return _log_decision(final_result, "Final Consensus")

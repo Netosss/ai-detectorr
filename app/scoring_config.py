@@ -116,8 +116,8 @@ class ScoringConfig:
         "CONFLICT_MODEL_LOW": 0.8,
         
         # Final Confidence
-        "LIKELY_AI": 0.92,
-        "POSSIBLE_AI": 0.75,
-        "SUSPICIOUS_AI": 0.50,
-        "LIKELY_HUMAN_NOISE": 0.20,
+        "LIKELY_AI": 0.85,          # Lowered slightly to catch 0.90s
+        "POSSIBLE_AI": 0.65,        # 0.65 - 0.85
+        "SUSPICIOUS_AI": 0.35,      # 0.35 - 0.65 (Wide Uncertain Zone)
+        "LIKELY_HUMAN_NOISE": 0.15, # < 0.15 is Likely Original
     }
