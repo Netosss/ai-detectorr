@@ -111,19 +111,35 @@ class RouterClassifier:
         
         # --- PATH: Ensemble A+B for ALL images ---
         if high_res_indices:
-            batch_ab = []
+            batch_a = []
+            batch_b = []
+            
             for i in high_res_indices:
                 img = images[i].convert("RGB")
-                # Resize if HUGE, but otherwise keep original for best quality
                 w, h = img.size
+                is_small = (w * h) < 50000
+                
+                # Model A always gets the raw image (maybe resized if huge)
+                img_a = img
                 if max(w, h) > 1500:
                     ratio = 1024 / max(w, h)
-                    img = img.resize((int(w*ratio), int(h*ratio)), Image.LANCZOS)
-                batch_ab.append(img)
+                    img_a = img.resize((int(w*ratio), int(h*ratio)), Image.LANCZOS)
+                batch_a.append(img_a)
+                
+                # Model B: Active Interrogation for Small Images
+                if is_small:
+                    # Inject Noise (Sigma=10) to wake up Model B specifically for small AI
+                    img_np = np.array(img)
+                    noise = np.random.normal(0, 10, img_np.shape)
+                    noisy_img = np.clip(img_np + noise, 0, 255).astype(np.uint8)
+                    batch_b.append(Image.fromarray(noisy_img))
+                else:
+                    # High res gets standard processing (same as A)
+                    batch_b.append(img_a)
             
             # Submit A and B in parallel
-            f_a = self.executor.submit(self._predict_single, self.model_a, self.processor_a, batch_ab)
-            f_b = self.executor.submit(self._predict_single, self.model_b, self.processor_b, batch_ab)
+            f_a = self.executor.submit(self._predict_single, self.model_a, self.processor_a, batch_a)
+            f_b = self.executor.submit(self._predict_single, self.model_b, self.processor_b, batch_b)
             futures[f_a] = ("A", high_res_indices)
             futures[f_b] = ("B", high_res_indices)
             
@@ -159,7 +175,7 @@ class RouterClassifier:
                     # High Res -> Standard Ensemble (A:60%, B:40%)
                     img_w, img_h = images[original_idx].size
                     if (img_w * img_h) < 50000:
-                        wA, wB = 0.80, 0.20
+                        wA, wB = 0.50, 0.50
                     else:
                         wA, wB = 0.60, 0.40
 
