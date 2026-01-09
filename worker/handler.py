@@ -71,10 +71,10 @@ class RouterClassifier:
             ).to(self.device).eval()
             # Removed torch.compile due to cold start latency and device errors
 
-            # Model C
-            self.processor_c = AutoImageProcessor.from_pretrained("dima806/ai_vs_real_image_detection", use_fast=True)
+            # Model C (Updated from dima806 to Bombek1/SigLIP-DINOv2)
+            self.processor_c = AutoImageProcessor.from_pretrained("Bombek1/ai-image-detector-siglip-dinov2", use_fast=True)
             self.model_c = AutoModelForImageClassification.from_pretrained(
-                "dima806/ai_vs_real_image_detection", torch_dtype=torch.float16
+                "Bombek1/ai-image-detector-siglip-dinov2", torch_dtype=torch.float16
             ).to(self.device).eval()
             # Removed torch.compile due to cold start latency and device errors
             
