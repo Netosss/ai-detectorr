@@ -58,21 +58,21 @@ class RouterClassifier:
             # Loading seq to avoid memory spike race conditions during init.
             
             # Model A
-            self.processor_a = AutoImageProcessor.from_pretrained("haywoodsloan/ai-image-detector-dev-deploy", use_fast=True)
+            self.processor_a = AutoImageProcessor.from_pretrained("haywoodsloan/ai-image-detector-dev-deploy")
             self.model_a = AutoModelForImageClassification.from_pretrained(
                 "haywoodsloan/ai-image-detector-dev-deploy", torch_dtype=torch.float16
             ).to(self.device).eval()
             # Removed torch.compile due to cold start latency and device errors
 
             # Model B
-            self.processor_b = AutoImageProcessor.from_pretrained("Ateeqq/ai-vs-human-image-detector", use_fast=True)
+            self.processor_b = AutoImageProcessor.from_pretrained("Ateeqq/ai-vs-human-image-detector")
             self.model_b = AutoModelForImageClassification.from_pretrained(
                 "Ateeqq/ai-vs-human-image-detector", torch_dtype=torch.float16
             ).to(self.device).eval()
             # Removed torch.compile due to cold start latency and device errors
 
             # Model C
-            self.processor_c = AutoImageProcessor.from_pretrained("dima806/ai_vs_real_image_detection", use_fast=True)
+            self.processor_c = AutoImageProcessor.from_pretrained("dima806/ai_vs_real_image_detection")
             self.model_c = AutoModelForImageClassification.from_pretrained(
                 "dima806/ai_vs_real_image_detection", torch_dtype=torch.float16
             ).to(self.device).eval()

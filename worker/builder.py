@@ -20,7 +20,7 @@ def download_models():
         logger.info(f"Downloading: {model_id}")
         try:
             # Download Processor
-            AutoImageProcessor.from_pretrained(model_id, use_fast=True)
+            AutoImageProcessor.from_pretrained(model_id)
             
             # Download Model (FP16/SafeTensors usually handled by auto)
             # We load with float16 to ensure we get the right shards if they exist specifically,
