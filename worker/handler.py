@@ -175,7 +175,8 @@ class RouterClassifier:
                     # High Res -> Standard Ensemble (A:60%, B:40%)
                     img_w, img_h = images[original_idx].size
                     if (img_w * img_h) < 50000:
-                        wA, wB = 0.50, 0.50
+                        # Low Res: Trust Model B (Noised) more, as A is prone to FP
+                        wA, wB = 0.30, 0.70
                     else:
                         wA, wB = 0.60, 0.40
 
