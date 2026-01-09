@@ -154,7 +154,15 @@ class RouterClassifier:
                     val_b_ai = float(prob_b[0])
                     val_b_real = float(prob_b[1])
                     
-                    wA, wB = 0.60, 0.40
+                    # Dynamic Weighing based on Resolution
+                    # Low Res (< 50k pixels) -> Trust Model A (80%) because B fails on small/compressed
+                    # High Res -> Standard Ensemble (A:60%, B:40%)
+                    img_w, img_h = images[original_idx].size
+                    if (img_w * img_h) < 50000:
+                        wA, wB = 0.80, 0.20
+                    else:
+                        wA, wB = 0.60, 0.40
+
                     score_ai = (val_a_ai * wA) + (val_b_ai * wB)
                     score_real = (val_a_real * wA) + (val_b_real * wB)
                     
