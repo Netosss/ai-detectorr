@@ -46,8 +46,8 @@ class RouterClassifier:
     def __init__(self):
         self.device = device
         self.models_loaded = False
-        # Thread pool for inference models (3 models max)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        # Thread pool for inference models (2 models max)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.load_models()
 
     def load_models(self):
@@ -71,20 +71,12 @@ class RouterClassifier:
             ).to(self.device).eval()
             # Removed torch.compile due to cold start latency and device errors
 
-            # Model C (Updated from dima806 to Bombek1/SigLIP-DINOv2)
-            self.processor_c = AutoImageProcessor.from_pretrained("Bombek1/ai-image-detector-siglip-dinov2", use_fast=True)
-            self.model_c = AutoModelForImageClassification.from_pretrained(
-                "Bombek1/ai-image-detector-siglip-dinov2", torch_dtype=torch.float16
-            ).to(self.device).eval()
-            # Removed torch.compile due to cold start latency and device errors
-            
             # Warmup
             dummy = Image.new('RGB', (224, 224), color='white')
-            # Warm all 3
+            # Warm both models
             f1 = self.executor.submit(self._predict_single, self.model_a, self.processor_a, [dummy])
             f2 = self.executor.submit(self._predict_single, self.model_b, self.processor_b, [dummy])
-            f3 = self.executor.submit(self._predict_single, self.model_c, self.processor_c, [dummy])
-            concurrent.futures.wait([f1, f2, f3])
+            concurrent.futures.wait([f1, f2])
             
             self.models_loaded = True
             logger.info("Router Models Loaded Successfully.")
@@ -112,29 +104,17 @@ class RouterClassifier:
     def predict_batch(self, images: list):
         results = [None] * len(images)
         
-        low_res_indices = []
-        high_res_indices = []
+        # Force all images to High Res path (Ensemble A+B)
+        high_res_indices = list(range(len(images)))
         
-        for i, img in enumerate(images):
-            w, h = img.size
-            if (w * h) < 200000:
-                low_res_indices.append(i)
-            else:
-                high_res_indices.append(i)
-                
         futures = {}
         
-        # --- PATH 1: Low Res (Model C) ---
-        if low_res_indices:
-            batch_c = [images[i].convert("RGB") for i in low_res_indices]
-            f_c = self.executor.submit(self._predict_single, self.model_c, self.processor_c, batch_c)
-            futures[f_c] = ("C", low_res_indices)
-
-        # --- PATH 2: High Res (Ensemble A+B) ---
+        # --- PATH: Ensemble A+B for ALL images ---
         if high_res_indices:
             batch_ab = []
             for i in high_res_indices:
                 img = images[i].convert("RGB")
+                # Resize if HUGE, but otherwise keep original for best quality
                 w, h = img.size
                 if max(w, h) > 1500:
                     ratio = 1024 / max(w, h)
@@ -155,31 +135,10 @@ class RouterClassifier:
             model_key, indices = futures[f]
             probs = f.result()
             
-            if probs is None: # handle error
-                continue
                 
-            if model_key == "C":
-                # Process C immediately
-                for idx_in_batch, original_idx in enumerate(indices):
-                    try:
-                        score_real = float(probs[idx_in_batch][0])
-                        score_ai = float(probs[idx_in_batch][1])
-                        label = "AI" if score_ai > 0.5 else "REAL"
-                        score = score_ai if label == "AI" else score_real
-                        results[original_idx] = {
-                            "ai_score": float(score_ai),
-                            "label": label,
-                            "confidence": float(score),
-                            "router": "LowRes_ModelC",
-                            "model_breakdown": {"C": score_ai}
-                        }
-                    except:
-                        pass
-            
-            else:
-                # Store A/B for later merge
-                for idx_in_batch, original_idx in enumerate(indices):
-                    high_res_results[original_idx][model_key] = probs[idx_in_batch]
+            # Store A/B for later merge
+            for idx_in_batch, original_idx in enumerate(indices):
+                high_res_results[original_idx][model_key] = probs[idx_in_batch]
 
         # Merge High Res
         for original_idx in high_res_indices:

@@ -8,9 +8,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("builder")
 
 def download_models():
+    models = [
         "haywoodsloan/ai-image-detector-dev-deploy",
-        "Ateeqq/ai-vs-human-image-detector",
-        "Bombek1/ai-image-detector-siglip-dinov2"
+        "Ateeqq/ai-vs-human-image-detector"
     ]
     
     logger.info("Starting build-time model download...")
