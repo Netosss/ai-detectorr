@@ -159,6 +159,7 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
             "ai_score": ai_score,
             "gpu_time_ms": gpu_time_ms,
             "model_score": job_result.get("model_score", ai_score) if job_result else ai_score,
+            "model_breakdown": job_result.get("model_breakdown", {}) if job_result else {},
             "error": job_result.get("error") if job_result else None
         }
     except Exception as e:

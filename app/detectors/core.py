@@ -551,6 +551,7 @@ async def detect_ai_media_image_logic(
     
     forensic_probability = gpu_result.get("ai_score", 0.0)
     actual_gpu_time_ms = gpu_result.get("gpu_time_ms", 0.0)
+    model_breakdown = gpu_result.get("model_breakdown", {})
     
     gpu_signals = [f"Forensic models scanned (Score: {forensic_probability:.2f})"]
     if gpu_result.get("error"):
@@ -625,7 +626,7 @@ async def detect_ai_media_image_logic(
         if "layers" in final_result and "layer1_metadata" in final_result["layers"]:
             h_score = meta_summary.get("human_score", 0.0)
             a_score = meta_summary.get("ai_score", 0.0)
-            logger.info(f"[DECISION] Verdict: {summary} ({final_conf:.2f}) | Source: Final Consensus | Scores: H={h_score}, A={a_score}, G={g_score_log}")
+            logger.info(f"[DECISION] Verdict: {summary} ({final_conf:.2f}) | Source: Final Consensus | Scores: H={h_score}, A={a_score}, G={g_score_log} | Models: {model_breakdown}")
             # Skip the helper _log_decision since we logged it manually with G-score
             return final_result
     except: pass
