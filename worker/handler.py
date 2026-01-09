@@ -62,21 +62,21 @@ class RouterClassifier:
             self.model_a = AutoModelForImageClassification.from_pretrained(
                 "haywoodsloan/ai-image-detector-dev-deploy", torch_dtype=torch.float16
             ).to(self.device).eval()
-            if self.device == "cuda": self.model_a = torch.compile(self.model_a, mode="reduce-overhead")
+            # Removed torch.compile due to cold start latency and device errors
 
             # Model B
             self.processor_b = AutoImageProcessor.from_pretrained("Ateeqq/ai-vs-human-image-detector", use_fast=True)
             self.model_b = AutoModelForImageClassification.from_pretrained(
                 "Ateeqq/ai-vs-human-image-detector", torch_dtype=torch.float16
             ).to(self.device).eval()
-            if self.device == "cuda": self.model_b = torch.compile(self.model_b, mode="reduce-overhead")
+            # Removed torch.compile due to cold start latency and device errors
 
             # Model C
             self.processor_c = AutoImageProcessor.from_pretrained("dima806/ai_vs_real_image_detection", use_fast=True)
             self.model_c = AutoModelForImageClassification.from_pretrained(
                 "dima806/ai_vs_real_image_detection", torch_dtype=torch.float16
             ).to(self.device).eval()
-            if self.device == "cuda": self.model_c = torch.compile(self.model_c, mode="reduce-overhead")
+            # Removed torch.compile due to cold start latency and device errors
             
             # Warmup
             dummy = Image.new('RGB', (224, 224), color='white')
