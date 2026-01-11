@@ -303,9 +303,10 @@ async def detect(
     file: UploadFile = File(...),
     trusted_metadata: Optional[str] = Form(None),
     # Capture-time sidecar fields (sent by mobile app)
-    captured_in_app: Optional[bool] = Form(False),
+    # Using Optional[str] for robustness against empty or malformed values from mobile clients
+    captured_in_app: Optional[str] = Form(None),
     capture_session_id: Optional[str] = Form(None),
-    capture_timestamp_ms: Optional[int] = Form(None),
+    capture_timestamp_ms: Optional[str] = Form(None),
     capture_path: Optional[str] = Form(None),
     capture_signature: Optional[str] = Form(None),
 ):
@@ -324,12 +325,26 @@ async def detect(
     # Merge explicit capture-time fields into sidecar_metadata (so detector has a single dict)
     if sidecar_metadata is None:
         sidecar_metadata = {}
+    
+    # Safely parse boolean
+    is_captured = False
     if captured_in_app:
+        is_captured = str(captured_in_app).lower() in ("true", "1", "yes")
+    
+    if is_captured:
         sidecar_metadata["captured_in_app"] = True
     if capture_session_id:
         sidecar_metadata["capture_session_id"] = capture_session_id
+    
+    # Safely parse timestamp
     if capture_timestamp_ms:
-        sidecar_metadata["capture_timestamp_ms"] = int(capture_timestamp_ms)
+        try:
+            # Handle empty strings or decimals
+            ts_val = float(capture_timestamp_ms)
+            sidecar_metadata["capture_timestamp_ms"] = int(ts_val)
+        except (ValueError, TypeError):
+            logger.warning(f"[REQUEST] Invalid capture_timestamp: {capture_timestamp_ms}")
+
     if capture_path:
         sidecar_metadata["capture_path"] = capture_path
     if capture_signature:
