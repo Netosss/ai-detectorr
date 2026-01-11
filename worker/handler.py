@@ -196,42 +196,61 @@ class RouterClassifier:
 
     def load_models(self):
         if self.models_loaded: return
-        logger.info("Loading Production Models (Run 30 Config)...")
+        t_boot_start = time.perf_counter()
+        logger.info("🚀 Booting Production Worker (Parallel Load)...")
+        
         try:
-            # Model A
-            self.processor_a = AutoImageProcessor.from_pretrained("haywoodsloan/ai-image-detector-dev-deploy", use_fast=True)
-            # Use float16 ONLY on CUDA for speed, float32 on CPU/MPS for stability
-            model_dtype = torch.float16 if self.device == "cuda" else torch.float32
-            
-            self.model_a = AutoModelForImageClassification.from_pretrained(
-                "haywoodsloan/ai-image-detector-dev-deploy", torch_dtype=model_dtype
-            ).to(self.device).eval()
+            # --- Parallel Loading ---
+            # We load Model A, Model B, and TruFor simultaneously to slash cold-start time
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as loader:
+                f_a = loader.submit(self._init_model_a)
+                f_b = loader.submit(self._init_model_b)
+                f_t = loader.submit(lambda: TruForWrapper(self.device))
+                
+                concurrent.futures.wait([f_a, f_b, f_t])
+                
+                self.model_a, self.processor_a = f_a.result()
+                self.model_b, self.processor_b = f_b.result()
+                self.trufor = f_t.result()
 
-            # Model B
-            self.processor_b = AutoImageProcessor.from_pretrained("Ateeqq/ai-vs-human-image-detector", use_fast=True)
-            self.model_b = AutoModelForImageClassification.from_pretrained(
-                "Ateeqq/ai-vs-human-image-detector", torch_dtype=model_dtype
-            ).to(self.device).eval()
+            # --- Optimizations ---
+            # Applying torch.compile BEFORE warmup ensures the 30s delay happens on boot, not handled by the user
+            if hasattr(torch, 'compile') and self.device == "cuda":
+                logger.info("🛠 Optimizing models (torch.compile)...")
+                try:
+                    self.model_a = torch.compile(self.model_a, mode="default")
+                    self.model_b = torch.compile(self.model_b, mode="default")
+                except Exception as ce:
+                    logger.warning(f"Could not compile: {ce}")
 
-            # TruFor
-            self.trufor = TruForWrapper(self.device)
-
-            # Warmup (IMPORTANT: Must happen after any compilation or optimization)
-            logger.info("Running model warmup...")
+            # --- Hot-Path Warmup ---
+            # Now we warm up everything. The first user request will be instant.
+            logger.info("🔥 Hard-warming inference engines...")
             dummy = Image.new('RGB', (224, 224), color='white')
-            # Run sequentially for warmup to ensure each model is initialized
-            self._predict_single(self.model_a, self.processor_a, [dummy])
-            self._predict_single(self.model_b, self.processor_b, [dummy])
-            self.trufor.predict([dummy])
-
-            # NOTE: torch.compile is removed for stability. 
-            # First-run compilation overhead was exceeding RunPod timeouts.
-
+            # Run a full batch through the parallel-executor logic to warm threads and VRAM
+            self.predict_batch([dummy])
+            
+            boot_ms = (time.perf_counter() - t_boot_start) * 1000
             self.models_loaded = True
-            logger.info("All Production Models Loaded Successfully.")
+            logger.info(f"✨ Production Worker Ready in {boot_ms:.2f}ms")
+            
         except Exception as e:
-            logger.error(f"Failed to load models: {e}")
+            logger.error(f"FATAL: Failed to boot worker: {e}", exc_info=True)
             raise
+
+    def _init_model_a(self):
+        mid = "haywoodsloan/ai-image-detector-dev-deploy"
+        proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
+        return model, proc
+
+    def _init_model_b(self):
+        mid = "Ateeqq/ai-vs-human-image-detector"
+        proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
+        return model, proc
 
     def _get_ai_idx(self, model):
         for idx, label in model.config.id2label.items():
