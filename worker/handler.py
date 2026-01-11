@@ -70,7 +70,6 @@ class TruForWrapper:
         t_start = time.perf_counter()
         
         # --- Direct Path Resolution (Optimized for RunPod) ---
-        # We know exactly where it is because we COPY it in the Dockerfile
         repo_root = Path("/app")
         trufor_path = repo_root / "third_party/grip/TruFor/TruFor_train_test"
         
@@ -78,17 +77,27 @@ class TruForWrapper:
         if not trufor_path.exists():
             trufor_path = Path(__file__).resolve().parent / "third_party/grip/TruFor/TruFor_train_test"
             
-        if str(trufor_path) not in sys.path:
-            sys.path.insert(0, str(trufor_path))
+        if not trufor_path.exists():
+            logger.error(f"❌ TruFor path not found at {trufor_path}")
+            return
+
+        # Add both the folder and its parent to be safe
+        for p in [str(trufor_path), str(trufor_path.parent)]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
             
         try:
-            from lib.config import config as trufor_config
-            from lib.utils import get_model
+            # We use absolute imports by ensuring the path is correct
+            import lib.config
+            import lib.utils
+            
+            trufor_config = lib.config.config
+            get_model = lib.utils.get_model
+            
             config_file = trufor_path / "lib/config/trufor_ph3.yaml"
             model_file = repo_root / "third_party/grip/TruFor/pretrained_models/weights/trufor.pth.tar"
             
             if not model_file.exists():
-                # Local fallback
                 model_file = trufor_path.parent / "pretrained_models/weights/trufor.pth.tar"
             
             cfg = trufor_config
@@ -111,6 +120,8 @@ class TruForWrapper:
             logger.info(f"✅ TruFor Ready (Direct Load) in {duration:.2f}ms")
         except Exception as e:
             logger.error(f"❌ Failed to load TruFor: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     @torch.no_grad()
     def predict(self, img_pil_list):
@@ -208,7 +219,7 @@ class RouterClassifier:
 
     def _init_model_a(self):
         mid = "haywoodsloan/ai-image-detector-dev-deploy"
-        proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
+        proc = AutoImageProcessor.from_pretrained(mid, use_fast=False)
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
         if self.device == "cuda":
@@ -217,7 +228,7 @@ class RouterClassifier:
 
     def _init_model_b(self):
         mid = "Ateeqq/ai-vs-human-image-detector"
-        proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
+        proc = AutoImageProcessor.from_pretrained(mid, use_fast=False)
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
         if self.device == "cuda":

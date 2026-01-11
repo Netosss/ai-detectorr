@@ -25,7 +25,7 @@ def download_models():
         try:
             # 1. Download Processor
             logger.info(f"  Fetching processor for {model_id}...")
-            AutoImageProcessor.from_pretrained(model_id, use_fast=True)
+            AutoImageProcessor.from_pretrained(model_id, use_fast=False)
             
             # 2. Download Model in FP16
             logger.info(f"  Fetching model weights for {model_id} (FP16)...")
