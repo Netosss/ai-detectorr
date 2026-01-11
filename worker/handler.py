@@ -75,6 +75,7 @@ class TruForWrapper:
             repo_root / "third_party/grip/TruFor/TruFor_train_test",
             repo_root / "third_party/TruFor/TruFor_train_test",
             current_dir / "third_party/grip/TruFor/TruFor_train_test",
+            Path("/app/third_party/grip/TruFor/TruFor_train_test"),
         ]
         
         trufor_path = None
@@ -210,23 +211,16 @@ class RouterClassifier:
             # TruFor
             self.trufor = TruForWrapper(self.device)
 
-            # Warmup
+            # Warmup (IMPORTANT: Must happen after any compilation or optimization)
+            logger.info("Running model warmup...")
             dummy = Image.new('RGB', (224, 224), color='white')
-            self.predict_batch([dummy])
-            
-            # --- Performance Optimization: torch.compile ---
-            # This can provide a 10-20% speedup on modern GPUs (4090/A100)
-            if hasattr(torch, 'compile') and self.device == "cuda":
-                logger.info("Compiling models for optimized inference...")
-                try:
-                    # Switch from 'reduce-overhead' (which uses CUDA graphs) to 'default' 
-                    # for stability against TLS/AssertionErrors in PyTorch 2.2.
-                    self.model_a = torch.compile(self.model_a, mode="default")
-                    self.model_b = torch.compile(self.model_b, mode="default")
-                    # TruFor is a custom module, compiling it might be complex, 
-                    # staying with standard eval for now to ensure stability.
-                except Exception as ce:
-                    logger.warning(f"Could not compile models: {ce}")
+            # Run sequentially for warmup to ensure each model is initialized
+            self._predict_single(self.model_a, self.processor_a, [dummy])
+            self._predict_single(self.model_b, self.processor_b, [dummy])
+            self.trufor.predict([dummy])
+
+            # NOTE: torch.compile is removed for stability. 
+            # First-run compilation overhead was exceeding RunPod timeouts.
 
             self.models_loaded = True
             logger.info("All Production Models Loaded Successfully.")
@@ -312,7 +306,8 @@ class RouterClassifier:
         f_t = self.executor.submit(self.trufor.predict, batch_t)
         
         # We use a timeout to prevent absolute "stuck" states
-        done, not_done = concurrent.futures.wait([f_a, f_b, f_t], timeout=15.0)
+        # Increased to 30s to account for potentially hardware initialization on cold start
+        done, not_done = concurrent.futures.wait([f_a, f_b, f_t], timeout=30.0)
         
         if not_done:
             logger.warning(f"Inference timed out for {len(not_done)} models!")
