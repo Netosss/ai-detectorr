@@ -223,7 +223,7 @@ class RouterClassifier:
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
         if self.device == "cuda":
-            model = model.to(memory_format=torch.channels_last)
+            model = model.half().to(memory_format=torch.channels_last)
         return model, proc
 
     def _init_model_b(self):
@@ -232,7 +232,7 @@ class RouterClassifier:
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
         if self.device == "cuda":
-            model = model.to(memory_format=torch.channels_last)
+            model = model.half().to(memory_format=torch.channels_last)
         return model, proc
 
     def _get_ai_idx(self, model):
@@ -247,17 +247,21 @@ class RouterClassifier:
             # Use fast path for tensor conversion
             inputs = processor(images=images, return_tensors="pt")
             
+            # Get the model's actual parameter dtype to avoid Half/Float mismatch
+            model_dtype = next(model.parameters()).dtype
+            
             # Transfer to GPU with non_blocking=True
             for k, v in inputs.items():
                 if isinstance(v, torch.Tensor):
+                    v = v.to(self.device, non_blocking=True)
                     # channels_last is only for 4D tensors (B, C, H, W)
                     if v.ndim == 4:
-                        inputs[k] = v.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-                    else:
-                        inputs[k] = v.to(self.device, non_blocking=True)
-                        
-                    if inputs[k].dtype == torch.float32 and getattr(model, "dtype", torch.float32) == torch.float16:
-                        inputs[k] = inputs[k].half()
+                        v = v.to(memory_format=torch.channels_last)
+                    
+                    if v.is_floating_point():
+                        v = v.to(model_dtype)
+                    
+                    inputs[k] = v
             
             outputs = model(**inputs)
             probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
