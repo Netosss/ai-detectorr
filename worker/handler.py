@@ -65,21 +65,16 @@ class TruForWrapper:
         self.load_model()
 
     def load_model(self):
+        t_start = time.perf_counter()
         # Optimized path resolution for RunPod (Docker) and Local
         current_dir = Path(__file__).resolve().parent
-        repo_root = current_dir
-        
-        # In Docker, repo_root is /app
-        # Locally, it's the project root
+        repo_root = Path("/app") if Path("/app").exists() else current_dir
         
         # --- Exhaustive search for TruFor lib ---
         possible_trufor_dirs = [
-            Path("/app/third_party/grip/TruFor/TruFor_train_test"),
-            Path("/app/third_party/TruFor/TruFor_train_test"),
             repo_root / "third_party/grip/TruFor/TruFor_train_test",
             repo_root / "third_party/TruFor/TruFor_train_test",
             current_dir / "third_party/grip/TruFor/TruFor_train_test",
-            current_dir.parent / "third_party/grip/TruFor/TruFor_train_test",
         ]
         
         trufor_path = None
@@ -88,8 +83,28 @@ class TruForWrapper:
                 trufor_path = d
                 break
         
+        # Fallback: Recursive search for the unique ph3 config file if initial search fails
+        if not trufor_path:
+            logger.info("Performing emergency recursive search for TruFor lib...")
+            search_base = repo_root / "third_party"
+            for p in search_base.rglob("trufor_ph3.yaml"):
+                # The lib folder should be nearby: p is .../lib/config/trufor_ph3.yaml
+                potential_root = p.parent.parent.parent
+                if (potential_root / "lib").exists():
+                    trufor_path = potential_root
+                    logger.info(f"Emergency search found TruFor lib at: {trufor_path}")
+                    break
+
         if not trufor_path:
             logger.error("Failed to locate TruFor lib in any expected path.")
+            # Debug: List what we DO have
+            try:
+                if (repo_root / "third_party").exists():
+                    logger.info(f"Contents of {repo_root / 'third_party'}:")
+                    for item in (repo_root / "third_party").iterdir():
+                        logger.info(f"  - {item}")
+            except Exception as le:
+                logger.error(f"Could not list directory: {le}")
             return
 
         if str(trufor_path) not in sys.path:
@@ -100,16 +115,24 @@ class TruForWrapper:
             from lib.config import config as trufor_config
             from lib.utils import get_model
             config_file = trufor_path / "lib/config/trufor_ph3.yaml"
-            weights_path = repo_root / "third_party/grip/TruFor/pretrained_models"
-            if not weights_path.exists():
-                weights_path = repo_root / "third_party/TruFor/pretrained_models"
             
-            model_file = weights_path / "weights/trufor.pth.tar"
+            # Find weights pathly
+            model_file = None
+            weights_roots = [trufor_path.parent / "pretrained_models", repo_root / "third_party/grip/TruFor/pretrained_models"]
+            for wr in weights_roots:
+                potential = wr / "weights/trufor.pth.tar"
+                if potential.exists():
+                    model_file = potential
+                    break
+            
+            if not model_file:
+                raise FileNotFoundError("Could not find trufor.pth.tar weights file.")
             
             cfg = trufor_config
             cfg.defrost()
             cfg.merge_from_file(str(config_file))
-            # Standardize internal weight paths
+            
+            # Standardize internal weight paths (assuming they are in TruFor_train_test/pretrained_models)
             base_pretrained = trufor_path / "pretrained_models"
             cfg.MODEL.EXTRA.NOISEPRINT = str(base_pretrained / "noiseprint++/noiseprint++.th")
             cfg.MODEL.EXTRA.SEGFORMER = str(base_pretrained / "segformers/mit_b2.pth")
@@ -119,7 +142,9 @@ class TruForWrapper:
             checkpoint = torch.load(model_file, map_location=torch.device(self.device), weights_only=False)
             self.model.load_state_dict(checkpoint.get('state_dict', checkpoint))
             self.model = self.model.to(self.device).eval()
-            logger.info("TruFor Loaded Successfully.")
+            
+            duration = (time.perf_counter() - t_start) * 1000
+            logger.info(f"TruFor Loaded Successfully in {duration:.2f}ms")
         except Exception as e:
             logger.error(f"Failed to load TruFor: {e}", exc_info=True)
 
@@ -278,16 +303,31 @@ class RouterClassifier:
             if pixels >= 200000: img_t = apply_sharpen(img, 110)
             batch_t.append(img_t)
 
-        # Launch all 3 models in parallel
+        # Launch all 3 models in parallel with timing
+        logger.info(f"Starting inference batch (size={batch_size})...")
+        t_inf_start = time.perf_counter()
+        
         f_a = self.executor.submit(self._predict_single, self.model_a, self.processor_a, batch_a)
         f_b = self.executor.submit(self._predict_single, self.model_b, self.processor_b, batch_b)
         f_t = self.executor.submit(self.trufor.predict, batch_t)
         
-        concurrent.futures.wait([f_a, f_b, f_t])
+        # We use a timeout to prevent absolute "stuck" states
+        done, not_done = concurrent.futures.wait([f_a, f_b, f_t], timeout=15.0)
         
-        res_a = f_a.result()
-        res_b = f_b.result()
-        res_t = f_t.result()
+        if not_done:
+            logger.warning(f"Inference timed out for {len(not_done)} models!")
+            for f in not_done:
+                # We can't easily kill threads, but we can log which one failed
+                if f == f_a: logger.error("Model A hang detected.")
+                elif f == f_b: logger.error("Model B hang detected.")
+                elif f == f_t: logger.error("TruFor hang detected.")
+
+        res_a = f_a.result() if f_a.done() else [0.5] * batch_size
+        res_b = f_b.result() if f_b.done() else [0.5] * batch_size
+        res_t = f_t.result() if f_t.done() else [0.5] * batch_size
+        
+        inf_duration = (time.perf_counter() - t_inf_start) * 1000
+        logger.info(f"Inference batch completed in {inf_duration:.2f}ms")
         
         final_results = []
         for i in range(batch_size):
