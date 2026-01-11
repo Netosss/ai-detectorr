@@ -6,9 +6,9 @@ ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 # --- CACHE & ENVIRONMENT SETTINGS ---
-# HF_HOME: Base for model caching
 ENV HF_HOME=/app/cache
-ENV PYTHONPATH="/app:/app/third_party/grip/TruFor/TruFor_train_test"
+# We set PYTHONPATH to include common locations, but handler.py also does dynamic injection
+ENV PYTHONPATH="/app:/app/third_party/grip/TruFor/TruFor_train_test:${PYTHONPATH}"
 
 WORKDIR /app
 
@@ -25,13 +25,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     rm -rf /root/.cache/pip
 
 # --- BAKE MODELS ---
-# HuggingFace models (Model A & B)
 COPY worker/builder.py /app/builder.py
 RUN python /app/builder.py && rm /app/builder.py
 
-# --- CORE FILES (Surgical Copy to save context) ---
-# We ONLY copy the necessary TruFor files to avoid transferring unused third_party data
-COPY third_party/grip/TruFor /app/third_party/grip/TruFor
+# --- CORE FILES ---
+# Copy the entire third_party folder to maintain complex submodule structures
+COPY third_party /app/third_party
 
 # Copy production config
 COPY configs/production_v1.json /app/configs/production_v1.json

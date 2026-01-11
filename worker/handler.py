@@ -72,36 +72,56 @@ class TruForWrapper:
         # In Docker, repo_root is /app
         # Locally, it's the project root
         
-        trufor_path = repo_root / "third_party/grip/TruFor/TruFor_train_test"
-        if not (trufor_path / "lib").exists():
-            # Fallback for unexpected Docker structures
-            logger.warning(f"TruFor lib not found at {trufor_path}/lib, searching higher...")
-            potential_path = repo_root / "third_party/TruFor/TruFor_train_test"
-            if (potential_path / "lib").exists():
-                trufor_path = potential_path
-            
+        # --- Exhaustive search for TruFor lib ---
+        possible_trufor_dirs = [
+            Path("/app/third_party/grip/TruFor/TruFor_train_test"),
+            Path("/app/third_party/TruFor/TruFor_train_test"),
+            repo_root / "third_party/grip/TruFor/TruFor_train_test",
+            repo_root / "third_party/TruFor/TruFor_train_test",
+            current_dir / "third_party/grip/TruFor/TruFor_train_test",
+            current_dir.parent / "third_party/grip/TruFor/TruFor_train_test",
+        ]
+        
+        trufor_path = None
+        for d in possible_trufor_dirs:
+            if (d / "lib").exists():
+                trufor_path = d
+                break
+        
+        if not trufor_path:
+            logger.error("Failed to locate TruFor lib in any expected path.")
+            return
+
         if str(trufor_path) not in sys.path:
             sys.path.insert(0, str(trufor_path))
-            logger.info(f"Injected {trufor_path} into sys.path")
+            logger.info(f"Initialized TruFor path: {trufor_path}")
             
         try:
             from lib.config import config as trufor_config
             from lib.utils import get_model
             config_file = trufor_path / "lib/config/trufor_ph3.yaml"
-            model_file = repo_root / "third_party/grip/TruFor/pretrained_models/weights/trufor.pth.tar"
+            weights_path = repo_root / "third_party/grip/TruFor/pretrained_models"
+            if not weights_path.exists():
+                weights_path = repo_root / "third_party/TruFor/pretrained_models"
+            
+            model_file = weights_path / "weights/trufor.pth.tar"
+            
             cfg = trufor_config
             cfg.defrost()
             cfg.merge_from_file(str(config_file))
-            cfg.MODEL.EXTRA.NOISEPRINT = str(repo_root / "third_party/grip/TruFor/TruFor_train_test/pretrained_models/noiseprint++/noiseprint++.th")
-            cfg.MODEL.EXTRA.SEGFORMER = str(repo_root / "third_party/grip/TruFor/TruFor_train_test/pretrained_models/segformers/mit_b2.pth")
+            # Standardize internal weight paths
+            base_pretrained = trufor_path / "pretrained_models"
+            cfg.MODEL.EXTRA.NOISEPRINT = str(base_pretrained / "noiseprint++/noiseprint++.th")
+            cfg.MODEL.EXTRA.SEGFORMER = str(base_pretrained / "segformers/mit_b2.pth")
             cfg.freeze()
+            
             self.model = get_model(cfg)
             checkpoint = torch.load(model_file, map_location=torch.device(self.device), weights_only=False)
             self.model.load_state_dict(checkpoint.get('state_dict', checkpoint))
             self.model = self.model.to(self.device).eval()
             logger.info("TruFor Loaded Successfully.")
         except Exception as e:
-            logger.error(f"Failed to load TruFor: {e}")
+            logger.error(f"Failed to load TruFor: {e}", exc_info=True)
 
     @torch.no_grad()
     def predict(self, img_pil_list):
