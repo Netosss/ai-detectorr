@@ -1,42 +1,37 @@
-# Exclude all by default to keep worker image slim
-# Then selectively include what the worker needs
+# Exclude all by default to keep images slim
 **
 
 # --- INCLUSIONS ---
+!app/
 !worker/
 !third_party/
-!configs/production_v1.json
+!configs/
 !requirements.txt
+!Dockerfile
+!worker/Dockerfile
 
-# --- EXCLUSIONS (from within inclusions) ---
-worker/__pycache__
-worker/.venv
-worker/.dockerignore
-third_party/**/__pycache__
-third_party/**/.git
-third_party/**/node_modules
+# --- EXCLUSIONS ---
+# Folders
+**/__pycache__
+**/.venv
+**/node_modules
+**/.git
+**/.cursor
+**/terminals
+**/tests
+**/reports
 
-# --- Standard Exclusions ---
-.git
-.venv
-venv
-env
-__pycache__
-node_modules
-*.log
-*.csv
-*.jsonl
-*.md
-tests/
-reports/
-app/
-Dockerfile
-docker-compose.yml
-requirements-dev.txt
-Makefile
-.dockerignore
-.gitignore
-.gitmodules
-.env
-.cursor/
-terminals/
+# Files
+**/*.log
+**/*.csv
+**/*.jsonl
+**/*.md
+**/.DS_Store
+**/.env*
+**/.gitignore
+**/.dockerignore
+**/.gitmodules
+**/requirements-dev.txt
+**/Makefile
+**/docker-compose.yml
+**/usage_log.csv
