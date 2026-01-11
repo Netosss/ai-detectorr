@@ -1,6 +1,7 @@
 runpod
 transformers==4.48.3
-torch
+accelerate
+safetensors
 Pillow
 timm
 numpy<2
