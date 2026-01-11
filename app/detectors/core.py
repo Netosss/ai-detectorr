@@ -251,7 +251,16 @@ async def detect_ai_media(file_path: str, trusted_metadata: dict = None, origina
         return {
             "summary": "Verified AI" if is_ai else "Verified Human",
             "confidence_score": 1.0,
-            "layers": {"layer1_metadata": {"status": "verified_ai" if is_ai else "verified_human", "provider": generator}}
+            "suspicious": False,
+            "layers": {
+                "layer1_metadata": {
+                    "status": "verified_ai" if is_ai else "verified_human", 
+                    "provider": generator,
+                    "description": "Media verified via C2PA manifest."
+                },
+                "layer2_forensics": {"status": "skipped"}
+            },
+            "gpu_bypassed": True
         }
 
     if file_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
