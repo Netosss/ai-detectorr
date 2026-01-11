@@ -174,8 +174,10 @@ class RouterClassifier:
             if hasattr(torch, 'compile') and self.device == "cuda":
                 logger.info("Compiling models for optimized inference...")
                 try:
-                    self.model_a = torch.compile(self.model_a, mode="reduce-overhead")
-                    self.model_b = torch.compile(self.model_b, mode="reduce-overhead")
+                    # Switch from 'reduce-overhead' (which uses CUDA graphs) to 'default' 
+                    # for stability against TLS/AssertionErrors in PyTorch 2.2.
+                    self.model_a = torch.compile(self.model_a, mode="default")
+                    self.model_b = torch.compile(self.model_b, mode="default")
                     # TruFor is a custom module, compiling it might be complex, 
                     # staying with standard eval for now to ensure stability.
                 except Exception as ce:
