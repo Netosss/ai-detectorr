@@ -14,11 +14,13 @@ from collections import OrderedDict
 from PIL import Image, ImageFilter
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-# ---------------- Optimization Flags ----------------
-torch.set_float32_matmul_precision('high')
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+# ---------------- Optimization Flags (RTX 4090 Optimized) ----------------
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')  # Enables TF32 on 4090
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True       # cuDNN will find fastest kernels for 4090 architecture
+    torch.backends.cudnn.deterministic = False  # Prioritize speed over bit-wise reproducibility
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -223,12 +225,12 @@ class RouterClassifier:
                 except Exception as ce:
                     logger.warning(f"Could not compile: {ce}")
 
-            # --- Hot-Path Warmup ---
-            # Now we warm up everything. The first user request will be instant.
-            logger.info("🔥 Hard-warming inference engines...")
+            # Warmup (IMPORTANT: Moves 4090 initialization/compilation to boot phase)
+            logger.info("🔥 RTX 4090: Hard-warming inference engines (moving JIT to boot)...")
             dummy = Image.new('RGB', (224, 224), color='white')
-            # Run a full batch through the parallel-executor logic to warm threads and VRAM
-            self.predict_batch([dummy])
+            # Run multiple warmups to ensure cuDNN benchmarks are settled
+            for _ in range(2):
+                self.predict_batch([dummy])
             
             boot_ms = (time.perf_counter() - t_boot_start) * 1000
             self.models_loaded = True
