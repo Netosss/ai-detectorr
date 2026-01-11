@@ -73,13 +73,17 @@ class TruForWrapper:
         # Locally, it's the project root
         
         trufor_path = repo_root / "third_party/grip/TruFor/TruFor_train_test"
-        if not trufor_path.exists():
-            # Fallback for some local dev structures
-            repo_root = repo_root.parent
-            trufor_path = repo_root / "third_party/grip/TruFor/TruFor_train_test"
+        if not (trufor_path / "lib").exists():
+            # Fallback for unexpected Docker structures
+            logger.warning(f"TruFor lib not found at {trufor_path}/lib, searching higher...")
+            potential_path = repo_root / "third_party/TruFor/TruFor_train_test"
+            if (potential_path / "lib").exists():
+                trufor_path = potential_path
             
         if str(trufor_path) not in sys.path:
             sys.path.insert(0, str(trufor_path))
+            logger.info(f"Injected {trufor_path} into sys.path")
+            
         try:
             from lib.config import config as trufor_config
             from lib.utils import get_model
@@ -198,7 +202,12 @@ class RouterClassifier:
             # Transfer to GPU with non_blocking=True
             for k, v in inputs.items():
                 if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    # channels_last is only for 4D tensors (B, C, H, W)
+                    if v.ndim == 4:
+                        inputs[k] = v.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    else:
+                        inputs[k] = v.to(self.device, non_blocking=True)
+                        
                     if inputs[k].dtype == torch.float32 and getattr(model, "dtype", torch.float32) == torch.float16:
                         inputs[k] = inputs[k].half()
             
@@ -207,7 +216,7 @@ class RouterClassifier:
             ai_idx = self._get_ai_idx(model)
             return probs[:, ai_idx].cpu().numpy()
         except Exception as e:
-            logger.error(f"Inference error: {e}")
+            logger.error(f"Inference error in _predict_single: {e}", exc_info=True)
             return [0.5] * len(images)
 
     def predict_batch(self, images: list, is_png_list: list = None):

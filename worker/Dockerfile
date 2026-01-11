@@ -5,10 +5,10 @@ FROM runpod/pytorch:2.2.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
-# --- CACHE SETTINGS ---
+# --- CACHE & ENVIRONMENT SETTINGS ---
 # Bake models into the image to eliminate runtime downloads and reduce cold start
 ENV HF_HOME=/app/cache
-ENV TRANSFORMERS_CACHE=/app/cache
+ENV PYTHONPATH="/app:/app/third_party/grip/TruFor/TruFor_train_test:${PYTHONPATH}"
 
 WORKDIR /app
 
