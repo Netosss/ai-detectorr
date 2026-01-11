@@ -29,6 +29,7 @@ class MetadataSummary(BaseModel):
 class DetectionResponse(BaseModel):
     summary: str
     confidence_score: float
+    suspicious: bool = False
     layers: DetectionLayers
     gpu_time_ms: Optional[float] = 0.0
     gpu_bypassed: Optional[bool] = False
