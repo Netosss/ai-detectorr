@@ -267,7 +267,17 @@ async def detect_ai_media(file_path: str, trusted_metadata: dict = None, origina
         # Video Logic
         video_metadata = await get_video_metadata(file_path)
         h_s, a_s, sigs, exit = get_video_metadata_score(video_metadata, os.path.basename(file_path), file_path)
-        if exit: return {"summary": f"Verified {exit.capitalize()} Video", "confidence_score": 0.99}
+        if exit:
+            return {
+                "summary": f"Verified {exit.capitalize()} Video", 
+                "confidence_score": 0.99,
+                "suspicious": False,
+                "gpu_bypassed": True,
+                "layers": {
+                    "layer1_metadata": {"status": f"verified_{exit}", "description": "Video metadata indicates trusted source."},
+                    "layer2_forensics": {"status": "skipped"}
+                }
+            }
         loop = asyncio.get_running_loop()
         frames, _ = await loop.run_in_executor(None, extract_video_frames, file_path)
         if not frames: return {"summary": "Analysis Failed", "confidence_score": 0.0}
@@ -275,7 +285,12 @@ async def detect_ai_media(file_path: str, trusted_metadata: dict = None, origina
         batch_result = await run_batch_forensics(frames)
         probs = [r.get("ai_score", 0.0) for r in batch_result.get("results", [])]
         final_p = float(np.median(probs)) if probs else 0.0
-        return {"summary": "Likely AI" if final_p > 0.5 else "Likely Human", "confidence_score": round(final_p, 2)}
+        return {
+            "summary": "Likely AI" if final_p > 0.5 else "Likely Human", 
+            "confidence_score": round(final_p, 2),
+            "suspicious": (0.4 <= final_p <= 0.6), # Simple suspicion logic for video
+            "gpu_bypassed": False
+        }
     
     return await detect_ai_media_image_logic(file_path, l1_data, trusted_metadata=trusted_metadata, original_filename=original_filename)
 
@@ -305,13 +320,33 @@ async def detect_ai_media_image_logic(file_path: Optional[str], l1_data: dict = 
     # --- 1. DUAL-GATE METADATA (RUN 30) ---
     if m_h > PROD_CONFIG['dual_gate_metadata']['human_threshold']:
         return {
-            "summary": "Verified Human (Metadata)", "confidence_score": 1.0,
-            "layers": {"layer1_metadata": {"status": "verified_human", "signals": h_signals}, "layer2_forensics": {"status": "skipped"}}
+            "summary": "Verified Human (Metadata)", 
+            "confidence_score": 1.0,
+            "suspicious": False,
+            "gpu_bypassed": True,
+            "layers": {
+                "layer1_metadata": {
+                    "status": "verified_human", 
+                    "signals": h_signals,
+                    "description": "Image metadata indicates verified human origin."
+                }, 
+                "layer2_forensics": {"status": "skipped"}
+            }
         }
     if m_ai > PROD_CONFIG['dual_gate_metadata']['ai_threshold']:
         return {
-            "summary": "Verified AI (Metadata)", "confidence_score": 1.0,
-            "layers": {"layer1_metadata": {"status": "verified_ai", "signals": ai_signals}, "layer2_forensics": {"status": "skipped"}}
+            "summary": "Verified AI (Metadata)", 
+            "confidence_score": 1.0,
+            "suspicious": False,
+            "gpu_bypassed": True,
+            "layers": {
+                "layer1_metadata": {
+                    "status": "verified_ai", 
+                    "signals": ai_signals,
+                    "description": "Image metadata contains known AI signatures."
+                }, 
+                "layer2_forensics": {"status": "skipped"}
+            }
         }
 
     # --- 2. GPU SCAN ---
