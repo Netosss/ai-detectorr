@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
 
 # --- CACHE & ENVIRONMENT SETTINGS ---
-# Bake models into the image to eliminate runtime downloads
+# HF_HOME: Base for model caching
 ENV HF_HOME=/app/cache
 ENV PYTHONPATH="/app:/app/third_party/grip/TruFor/TruFor_train_test"
 
@@ -18,27 +18,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-# Assumes build context is repo root
-COPY worker/requirements.txt .
-
-# Install dependencies
+# Copy requirements and install
+COPY worker/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r /app/requirements.txt && \
     rm -rf /root/.cache/pip
 
 # --- BAKE MODELS ---
-COPY worker/builder.py .
-RUN python builder.py && rm builder.py
+# HuggingFace models (Model A & B)
+COPY worker/builder.py /app/builder.py
+RUN python /app/builder.py && rm /app/builder.py
 
-# Copy third_party forensic dependencies
-COPY third_party ./third_party
+# --- CORE FILES (Surgical Copy to save context) ---
+# We ONLY copy the necessary TruFor files to avoid transferring unused third_party data
+COPY third_party/grip/TruFor /app/third_party/grip/TruFor
 
 # Copy production config
-COPY configs/production_v1.json ./configs/production_v1.json
+COPY configs/production_v1.json /app/configs/production_v1.json
 
 # Finally copy the handler code
-COPY worker/handler.py .
+COPY worker/handler.py /app/handler.py
 
 # Entry point
-CMD [ "python", "-u", "handler.py" ]
+CMD [ "python", "-u", "/app/handler.py" ]
