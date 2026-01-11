@@ -23,8 +23,21 @@ tuning_comprehensive_log.txt
 tuning_results_*.json
 hf_200_false_positives_meta.json
 
-# --- Local environment / editor ---
+# --- Environment / Editor ---
 .env.*
 .python-version
 .vscode/
 .idea/
+.cursor/
+
+# --- Configs (protect sensitive params) ---
+configs/*.json
+!configs/production_v1.json  # Exception if user wants this tracked
+
+# --- Large Binaries / Weights ---
+third_party/**/pretrained_models/**
+third_party/**/*.pth
+third_party/**/*.pth.tar
+third_party/**/*.th
+third_party/**/*.bin
+third_party/**/*.onnx

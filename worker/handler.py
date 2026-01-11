@@ -15,6 +15,7 @@ from PIL import Image, ImageFilter
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 # ---------------- Optimization Flags ----------------
+torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -164,6 +165,18 @@ class RouterClassifier:
             dummy = Image.new('RGB', (224, 224), color='white')
             self.predict_batch([dummy])
             
+            # --- Performance Optimization: torch.compile ---
+            # This can provide a 10-20% speedup on modern GPUs (4090/A100)
+            if hasattr(torch, 'compile') and self.device == "cuda":
+                logger.info("Compiling models for optimized inference...")
+                try:
+                    self.model_a = torch.compile(self.model_a, mode="reduce-overhead")
+                    self.model_b = torch.compile(self.model_b, mode="reduce-overhead")
+                    # TruFor is a custom module, compiling it might be complex, 
+                    # staying with standard eval for now to ensure stability.
+                except Exception as ce:
+                    logger.warning(f"Could not compile models: {ce}")
+
             self.models_loaded = True
             logger.info("All Production Models Loaded Successfully.")
         except Exception as e:
@@ -179,11 +192,15 @@ class RouterClassifier:
     @torch.no_grad()
     def _predict_single(self, model, processor, images):
         try:
-            inputs = processor(images=images, return_tensors="pt").to(self.device)
-            if self.device == "cuda" and "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(memory_format=torch.channels_last)
-                if getattr(model, "dtype", torch.float32) == torch.float16:
-                    inputs["pixel_values"] = inputs["pixel_values"].half()
+            # Use fast path for tensor conversion
+            inputs = processor(images=images, return_tensors="pt")
+            
+            # Transfer to GPU with non_blocking=True
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    inputs[k] = v.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+                    if inputs[k].dtype == torch.float32 and getattr(model, "dtype", torch.float32) == torch.float16:
+                        inputs[k] = inputs[k].half()
             
             outputs = model(**inputs)
             probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
