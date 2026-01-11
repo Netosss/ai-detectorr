@@ -1,634 +1,356 @@
-
 import logging
 import time
+import cv2
+import numpy as np
+import asyncio
 import os
+import json
 import random
+import math
+from collections import OrderedDict 
 from PIL import Image
-from typing import Optional
-import hmac
-import hashlib
-
-try:
-    import numpy as np  # type: ignore
-except Exception:  # pragma: no cover
-    # numpy is only needed for frame-based paths; file-path based detection can run without it.
-    np = None  # type: ignore
-
-from app.detectors.utils import LRUCache, get_image_hash, get_exif_data
-from app.detectors.video import extract_video_frames, get_video_metadata, get_video_metadata_score
-from app.detectors.metadata import get_forensic_metadata_score, get_ai_suspicion_score
+from PIL.ExifTags import TAGS
+from typing import Optional, Union
+from pathlib import Path
 from app.c2pa_reader import get_c2pa_manifest
-from app.runpod_client import run_deep_forensics, run_batch_forensics  # Lazy import might be better if circular deps arise
+from app.runpod_client import run_deep_forensics
 from app.security import security_manager
-from app.scoring_config import ScoringConfig
 
 logger = logging.getLogger(__name__)
 
+# --- PRODUCTION CONFIG LOAD ---
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROD_CONFIG_PATH = REPO_ROOT / "configs/production_v1.json"
+
+with open(PROD_CONFIG_PATH, 'r') as f:
+    PROD_CONFIG = json.load(f)
+
+# LRU Cache implementation for forensic results
+class LRUCache:
+    def __init__(self, capacity: int = 1000):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+
 forensic_cache = LRUCache(capacity=1000)
 
-def _benchmark_mode_enabled() -> bool:
-    """
-    Benchmark mode disables behaviors that distort offline evaluation:
-    - conflict-resolution that can override the (mocked) GPU output using metadata
-    - caching (benchmark harness also patches forensic_cache, but keep this as a safety net)
-    """
-    return os.getenv("AI_DETECTOR_BENCHMARK", "0").lower() in {"1", "true", "yes"}
+def get_image_hash(source: Union[str, Image.Image], fast_mode: bool = False) -> str:
+    """Generate a secure SHA-256 hash of the image source."""
+    if isinstance(source, str):
+        with open(source, 'rb') as f:
+            return security_manager.get_safe_hash(f.read(2048 * 1024))
+    else:
+        thumb = source.copy()
+        size = (32, 32) if fast_mode else (64, 64)
+        thumb.thumbnail(size)
+        thumb = thumb.convert("L")
+        return security_manager.get_safe_hash(np.array(thumb).tobytes())
 
-def _log_decision(result: dict, source: str) -> dict:
-    """Helper to log the final decision before returning."""
+def get_exif_data(file_path: str) -> dict:
+    """Extract EXIF metadata from the image."""
     try:
-        summary = result.get("summary", "N/A")
-        conf = result.get("confidence_score", 0.0)
-        meta = result.get("metadata", {}) or {}
-        # Handle cases where metadata might be nested differently or missing
-        h_score = meta.get("human_score", 0.0)
-        a_score = meta.get("ai_score", 0.0)
-        
-        # If it's a layer structure (Video), extract from layer1 if metadata is empty
-        if not meta and "layers" in result:
-            l1 = result["layers"].get("layer1_metadata", {})
-            h_score = l1.get("human_score", 0.0)
-            a_score = l1.get("ai_score", 0.0)
+        with Image.open(file_path) as img:
+            exif = img._getexif() or {}
+            exif_data = {}
+            for tag, value in exif.items():
+                decoded = TAGS.get(tag, tag)
+                exif_data[decoded] = value
+            return exif_data
+    except Exception:
+        return {}
 
-        logger.info(f"[DECISION] Verdict: {summary} ({conf:.2f}) | Source: {source} | Scores: H={h_score}, A={a_score}")
+def logit(p):
+    """Run 30 Logit Transform."""
+    p = max(min(p, 0.999999), 0.000001)
+    return math.log(p / (1.0 - p))
+
+def get_slice_name(pixels, w, h, ext, aspect):
+    """Run 30 Slice Logic."""
+    if pixels < 2000: return "thumbnail"
+    if 2000 <= pixels < 10000: return "low_res"
+    if 10000 <= pixels < 50000: return "10k-50k"
+    if 50000 <= pixels < 500000: return "50k-500k"
+    if pixels >= 500000: return ">500k"
+    if aspect < 0.8: return "portrait_tall"
+    if 0.8 <= aspect <= 1.2: return "squareish"
+    if ext == ".png": return "png"
+    return "default"
+
+def is_frame_quality_ok(frame: np.ndarray, min_brightness: float = 20, min_sharpness: float = 50) -> tuple:
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = np.mean(gray)
+        if brightness < min_brightness:
+            return False, brightness, 0.0
+        h, w = gray.shape
+        center_crop = gray[h//4:3*h//4, w//4:3*w//4]
+        laplacian_var = cv2.Laplacian(center_crop, cv2.CV_64F).var()
+        if laplacian_var < min_sharpness:
+            return False, brightness, laplacian_var
+        return True, brightness, laplacian_var
+    except:
+        return True, 128.0, 100.0
+
+def extract_video_frames(video_path: str) -> tuple:
+    frames = []
+    quality_rejected = 0
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened(): return [], 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0: return [], 0
+        sample_points = [int(total_frames * 0.20), int(total_frames * 0.50), int(total_frames * 0.80)]
+        for pos in sample_points:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ret, frame = cap.read()
+            if ret:
+                is_ok, brightness, sharpness = is_frame_quality_ok(frame)
+                if not is_ok:
+                    quality_rejected += 1
+                    continue
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
+        cap.release()
+        if quality_rejected > 0:
+            logger.info(f"[VIDEO] Skipped {quality_rejected} low-quality frames")
+        if len(frames) < 1 and total_frames >= 1:
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * 0.5))
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
+            cap.release()
     except Exception as e:
-        logger.error(f"[LOGGING] Error logging decision: {e}")
-    return result
+        logger.error(f"Error extracting video frames: {e}")
+    return frames, quality_rejected
 
-def _verify_capture_signature(trusted_metadata: dict) -> bool:
-    """
-    Optional hardening: if CAPTURE_HMAC_SECRET is set, require a valid signature before
-    trusting captured_in_app. If not set, we assume the endpoint is not publicly exposed.
-    """
-    secret = os.getenv("CAPTURE_HMAC_SECRET", "")
-    if not secret:
-        return True
-    sig = str((trusted_metadata or {}).get("capture_signature") or "")
-    if not sig:
-        return False
-    sid = str((trusted_metadata or {}).get("capture_session_id") or "")
-    ts = str((trusted_metadata or {}).get("capture_timestamp_ms") or (trusted_metadata or {}).get("capture_timestamp") or "")
-    path = str((trusted_metadata or {}).get("capture_path") or "")
-    payload = f"{sid}|{ts}|{path}".encode("utf-8")
-    expected = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+async def get_video_metadata(video_path: str) -> dict:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', video_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            if proc.returncode == 0: return json.loads(stdout.decode())
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+    except Exception as e:
+        logger.error(f"Error extracting video metadata: {e}")
+    return {}
 
-def boost_score(score: float, is_ai_likely: bool = True) -> float:
-    """
-    Boost confidence only for AI-likely results.
-    Human-likely results keep their raw confidence to avoid misleading scores.
-    """
-    if is_ai_likely:
-        return max(0.85, score)
-    return score  # No boost for human results
+def get_video_metadata_score(metadata: dict, filename: str = "", file_path: str = "") -> tuple:
+    human_score = 0.0
+    ai_score = 0.0
+    signals = []
+    if not metadata: return 0.0, 0.0, ["No metadata"], None
+    format_info = metadata.get("format", {})
+    tags = format_info.get("tags", {})
+    streams = metadata.get("streams", [])
+    tags_lower = {k.lower(): v for k, v in tags.items()}
+    encoder = str(tags_lower.get("encoder", "")).lower()
+    has_android_marker = any(m in k.lower() for m in ["com.android.version", "com.android.capture", "com.samsung"] for k in tags_lower)
+    has_ios_marker = any(m in tags_lower for m in ["com.apple.quicktime.make", "com.apple.quicktime.model", "com.apple.quicktime.software"])
+    device_marker = has_android_marker or has_ios_marker
+    has_ffmpeg = "lavf" in encoder
+    has_x264 = "x264" in encoder
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    duration = float(format_info.get("duration", 0))
+    fps = 0.0
+    if video_stream:
+        try:
+            fr = video_stream.get("avg_frame_rate", "0/1")
+            if "/" in fr:
+                num, den = fr.split("/")
+                fps = float(num)/float(den) if float(den)>0 else 0
+        except: pass
+    is_exact_fps = abs(fps-30)<0.001 or abs(fps-60)<0.001 or abs(fps-24)<0.001
+    if device_marker: human_score += 0.50
+    if fps > 0 and not is_exact_fps: human_score += 0.10
+    if any(b in encoder for b in ["iphone", "samsung", "sony", "canon"]): human_score += 0.20
+    if has_ffmpeg and has_x264 and not device_marker: ai_score += 0.50
+    if is_exact_fps: ai_score += 0.15
+    human_score = min(1.0, human_score)
+    ai_score = min(1.0, ai_score)
+    early_exit = "human" if human_score >= 0.6 and ai_score < 0.3 else "ai" if ai_score >= 0.7 and human_score < 0.2 else None
+    return human_score, ai_score, signals, early_exit
+
+def get_forensic_metadata_score(exif: dict) -> tuple:
+    score = 0.0
+    signals = []
+    def to_float(val):
+        try: return float(val)
+        except: return None
+    make = str(exif.get("Make", "")).lower()
+    software = str(exif.get("Software", "")).lower()
+    if any(m in make for m in ["apple", "google", "samsung", "sony", "canon", "nikon"]):
+        score += 0.35
+        signals.append("Trusted device manufacturer")
+    if any(s in software for s in ["ios", "android", "lightroom"]):
+        score += 0.25
+        signals.append("Validated vendor pipeline")
+    exp = to_float(exif.get("ExposureTime"))
+    if exp is not None and 0 < exp < 30:
+        score += 0.15
+        signals.append("Valid exposure")
+    iso = to_float(exif.get("ISOSpeedRatings"))
+    if iso is not None and 50 <= iso <= 102400:
+        score += 0.15
+        signals.append("Realistic ISO")
+    f_num = to_float(exif.get("FNumber"))
+    if f_num is not None and 0.95 <= f_num <= 32:
+        score += 0.15
+        signals.append("Valid aperture")
+    if "DateTimeOriginal" in exif: score += 0.08
+    return round(score, 2), signals
+
+def get_ai_suspicion_score(exif: dict, width: int = 0, height: int = 0, file_size: int = 0) -> tuple:
+    score = 0.0
+    signals = []
+    has_camera_info = exif.get("Make") or exif.get("Model")
+    ai_keywords = ["stable", "diffusion", "midjourney", "dalle", "flux", "sora", "generative"]
+    software = str(exif.get("Software", "")).lower()
+    make = str(exif.get("Make", "")).lower()
+    if any(k in software for k in ai_keywords) or any(k in make for k in ai_keywords):
+        score += 0.40
+        signals.append("AI software signature")
+    if not has_camera_info:
+        score += 0.10
+        signals.append("Missing hardware provenance")
+    if width > 0 and height > 0 and not has_camera_info:
+        if width in [512, 768, 1024, 1536, 2048] or height in [512, 768, 1024, 1536, 2048]:
+            score += 0.15
+            signals.append("AI-typical dimensions")
+    return round(min(score, 1.0), 2), signals
 
 async def detect_ai_media(file_path: str, trusted_metadata: dict = None, original_filename: str = None) -> dict:
-    """
-    Final Optimized Consensus Engine.
-    """
     total_start = time.perf_counter()
-    
-    l1_data = {
-        "status": "not_found",
-        "provider": None,
-        "description": "No cryptographic signature found."
-    }
-
-    # --- 1️⃣ LAYER 1: C2PA ---
+    l1_data = {"status": "not_found", "provider": None, "description": "No cryptographic signature found."}
     t_c2pa = time.perf_counter()
     manifest = get_c2pa_manifest(file_path)
-    c2pa_time_ms = (time.perf_counter() - t_c2pa) * 1000
-    logger.info(f"[TIMING] Layer 1 - C2PA check: {c2pa_time_ms:.2f}ms")
     if manifest:
         gen_info = manifest.get("claim_generator_info", [])
         generator = gen_info[0].get("name", "Unknown AI") if gen_info else manifest.get("claim_generator", "Unknown AI")
-
-        is_generative_ai = False
-        assertions = manifest.get("assertions", [])
-        for assertion in assertions:
-            if assertion.get("label") == "c2pa.actions.v2":
-                actions = assertion.get("data", {}).get("actions", [])
-                for action in actions:
-                    source_type = action.get("digitalSourceType", "")
-                    if "trainedAlgorithmicMedia" in source_type:
-                        is_generative_ai = True
-                    desc = action.get("description", "").lower()
-                    if any(term in desc for term in ["generative fill", "ai-modified", "edited with ai", "ai generated"]):
-                        is_generative_ai = True
-            if is_generative_ai: break
-
-        l1_data = {
-            "status": "verified_ai" if is_generative_ai else "verified_original",
-            "provider": generator,
-            "description": f"Verified AI signature found ({generator})." if is_generative_ai else "Verified original content."
-        }
-
-        return _log_decision({
-            "summary": "Verified AI" if is_generative_ai else "Verified Original",
-            "confidence_score": 1.0,
-            "layers": {
-                "layer1_metadata": l1_data,
-                "layer2_forensics": {
-                    "status": "skipped", 
-                    "probability": 1.0 if is_generative_ai else 0.0, 
-                    "signals": ["Source verified via cryptographic signature."]
-                }
-            },
-            "metadata": {
-                "human_score": 0.0 if is_generative_ai else 1.0,
-                "ai_score": 1.0 if is_generative_ai else 0.0,
-                "signals": ["C2PA cryptographic signature"],
-                "bypass_reason": "c2pa"
-            }
-        }, "C2PA Signature")
-
-    # --- IN-APP CAPTURE (Strongest Human Signal) ---
-    # Only trust this if:
-    # - captured_in_app=true AND
-    # - capture_session_id + capture timestamp exist AND
-    # - (optional) HMAC signature is valid when CAPTURE_HMAC_SECRET is configured.
-    if trusted_metadata and trusted_metadata.get("captured_in_app") is True:
-        has_sid = bool(trusted_metadata.get("capture_session_id"))
-        has_ts = bool(trusted_metadata.get("capture_timestamp_ms") or trusted_metadata.get("capture_timestamp"))
-        if has_sid and has_ts and _verify_capture_signature(trusted_metadata):
-            return _log_decision({
-                "summary": "Verified Original (In-App Capture)",
-                "confidence_score": 0.99,
-                "layers": {
-                    "layer1_metadata": {
-                        "status": "verified_original",
-                        "provider": "InAppCapture",
-                        "description": "Captured inside the app (trusted capture session).",
-                        "human_score": 0.70,
-                        "ai_score": 0.0,
-                        "signals": [
-                            "Captured in app (strong provenance)"
-                        ]
-                    },
-                    "layer2_forensics": {
-                        "status": "skipped",
-                        "probability": 0.0,
-                        "signals": [
-                            "Captured in app (captured_in_app=true)",
-                            f"capture_session_id={trusted_metadata.get('capture_session_id')}",
-                            f"capture_timestamp_ms={trusted_metadata.get('capture_timestamp_ms') or trusted_metadata.get('capture_timestamp')}",
-                        ],
-                    },
-                },
-                "gpu_time_ms": 0.0,
-                "gpu_bypassed": True,
-                "metadata": {
-                    "human_score": 0.70,
-                    "ai_score": 0.0,
-                    "signals": [
-                        "Captured in app (strong provenance)"
-                    ],
-                    "extracted": {
-                        "capture_session_id": trusted_metadata.get("capture_session_id"),
-                        "capture_timestamp_ms": trusted_metadata.get("capture_timestamp_ms") or trusted_metadata.get("capture_timestamp"),
-                        "capture_path": trusted_metadata.get("capture_path"),
-                    },
-                    "bypass_reason": "captured_in_app",
-                }
-            }, "In-App Capture")
-
-    is_video = file_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm'))
-    
-    if is_video:
-        safe_path = security_manager.sanitize_log_message(file_path)
-        filename = os.path.basename(file_path)
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        logger.info(f"Detecting AI in video: {safe_path} ({file_size_mb:.1f}MB)")
-        
-        if file_size_mb > 100:
-            logger.warning(f"[VIDEO] Large file ({file_size_mb:.0f}MB) - processing may take longer")
-        
-        # --- VIDEO METADATA EARLY EXIT ---
-        t_video_meta = time.perf_counter()
-        video_metadata = await get_video_metadata(file_path)
-        human_score, ai_meta_score, meta_signals, early_exit = get_video_metadata_score(video_metadata, filename, file_path)
-        
-        if early_exit == "original":
-            return {
-                "summary": "Verified Original Video",
-                "confidence_score": 0.99,
-                "layers": {
-                    "layer1_metadata": {
-                        "status": "verified_original",
-                        "provider": meta_signals[0] if meta_signals else "Camera/Phone",
-                        "description": "Video recorded on real device with authentic metadata.",
-                        "human_score": human_score,
-                        "ai_score": ai_meta_score
-                    },
-                    "layer2_forensics": {
-                        "status": "skipped",
-                        "probability": 0.0,
-                        "signals": meta_signals
-                    }
-                }
-            }
-        
-        if early_exit == "ai":
-            return {
-                "summary": "Verified AI Video",
-                "confidence_score": 0.99,
-                "layers": {
-                    "layer1_metadata": {
-                        "status": "verified_ai",
-                        "provider": meta_signals[0] if meta_signals else "AI Generator",
-                        "description": "Video generated by AI tool detected in metadata.",
-                        "human_score": human_score,
-                        "ai_score": ai_meta_score
-                    },
-                    "layer2_forensics": {
-                        "status": "skipped",
-                        "probability": 1.0,
-                        "signals": meta_signals
-                    }
-                }
-            }
-        
-        # No early exit - proceed to frame analysis
-        frames, quality_rejected = await extract_video_frames(file_path)
-        if not frames:
-            return {
-                "summary": "Analysis Failed",
-                "confidence_score": 0.0,
-                "layers": {
-                    "layer1_metadata": l1_data,
-                    "layer2_forensics": {
-                        "status": "error",
-                        "probability": 0.0,
-                        "signals": ["Could not extract frames from video"]
-                    }
-                }
-            }
-        
-        batch_result = await run_batch_forensics(frames)
-        
-        if batch_result.get("error"):
-            return {
-                "summary": "Analysis Failed",
-                "confidence_score": 0.0,
-                "layers": {
-                    "layer1_metadata": l1_data,
-                    "layer2_forensics": {
-                        "status": "error",
-                        "probability": 0.0,
-                        "signals": [f"Frame analysis failed: {batch_result['error']}"]
-                    }
-                }
-            }
-        
-        results = batch_result.get("results", [])
-        gpu_time_ms = batch_result.get("gpu_time_ms", 0.0)
-        
-        if not results:
-            return {
-                "summary": "Analysis Failed",
-                "confidence_score": 0.0,
-                "layers": {
-                    "layer1_metadata": l1_data,
-                    "layer2_forensics": {
-                        "status": "error",
-                        "probability": 0.0,
-                        "signals": ["No frame results returned"]
-                    }
-                }
-            }
-        
-        frame_probs = [r.get("ai_score", 0.0) for r in results if isinstance(r, dict) and "ai_score" in r]
-        
-        median_prob = float(np.median(frame_probs))
-        max_prob = float(np.max(frame_probs))
-        mean_prob = float(np.mean(frame_probs))
-        
-        # Aggregation Logic Refinement:
-        # If the median is low, a single high frame is likely a false positive (common in screen recordings)
-        if median_prob < 0.20:
-            if max_prob > 0.98: 
-                # Very strong signal on one frame. If we have few frames (<=3), this makes median < 0.2 possible (0.0, 0.0, 0.99 -> meds 0.0).
-                # One frame shouldn't condemn a video unless mean is significant.
-                final_prob = max_prob if mean_prob > 0.35 else 0.45 # Cap at suspicious, not detected
-            elif max_prob > 0.85:
-                # High outlier but not extreme -> suppressed
-                final_prob = median_prob
-            else:
-                final_prob = median_prob
-        else:
-            # If median is elevated, trust the max more
-            final_prob = max_prob if max_prob > 0.85 else median_prob
-        
-        is_ai_likely = final_prob > 0.5
-        if final_prob > 0.85: 
-            summary = "Likely AI Video"
-        elif final_prob > 0.5: 
-            summary = "Suspicious Video"
-        else: 
-            summary = "Likely Original Video"
-        
-        raw_conf = final_prob if is_ai_likely else 1.0 - final_prob
-        final_conf = boost_score(raw_conf, is_ai_likely=is_ai_likely)
-        if final_conf > 0.99: final_conf = 0.99
-
-        analysis_signals = [
-            f"Tri-frame batch analysis ({len(frames)} frames)",
-            f"Aggregation: median={median_prob:.2f}, max={max_prob:.2f}"
-        ]
-        if meta_signals:
-            analysis_signals.extend(meta_signals[:2])
-        
+        is_ai = any("trainedAlgorithmicMedia" in str(a) for a in manifest.get("assertions", []))
         return {
-            "summary": summary,
-            "confidence_score": round(final_conf, 2),
-            "layers": {
-                "layer1_metadata": l1_data,
-                "layer2_forensics": {
-                    "status": "detected" if final_prob > 0.5 else "not_detected",
-                    "probability": round(final_prob, 2),
-                    "signals": analysis_signals
-                }
-            },
-            "gpu_time_ms": gpu_time_ms
+            "summary": "Verified AI" if is_ai else "Verified Human",
+            "confidence_score": 1.0,
+            "layers": {"layer1_metadata": {"status": "verified_ai" if is_ai else "verified_human", "provider": generator}}
         }
-    else:
-        return await detect_ai_media_image_logic(file_path, l1_data, trusted_metadata=trusted_metadata, original_filename=original_filename)
 
-async def detect_ai_media_image_logic(
-    file_path: Optional[str], 
-    l1_data: dict = None, 
-    frame: Image.Image = None,
-    trusted_metadata: dict = None,
-    original_filename: str = None
-) -> dict:
-    """
-    Core consensus logic for images and video frames.
-    """
-    layer_start = time.perf_counter()
+    if file_path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+        # Video Logic
+        video_metadata = await get_video_metadata(file_path)
+        h_s, a_s, sigs, exit = get_video_metadata_score(video_metadata, os.path.basename(file_path), file_path)
+        if exit: return {"summary": f"Verified {exit.capitalize()} Video", "confidence_score": 0.99}
+        loop = asyncio.get_running_loop()
+        frames, _ = await loop.run_in_executor(None, extract_video_frames, file_path)
+        if not frames: return {"summary": "Analysis Failed", "confidence_score": 0.0}
+        from app.runpod_client import run_batch_forensics
+        batch_result = await run_batch_forensics(frames)
+        probs = [r.get("ai_score", 0.0) for r in batch_result.get("results", [])]
+        final_p = float(np.median(probs)) if probs else 0.0
+        return {"summary": "Likely AI" if final_p > 0.5 else "Likely Human", "confidence_score": round(final_p, 2)}
     
-    if l1_data is None:
-        l1_data = {"status": "not_found", "provider": None, "description": "N/A"}
+    return await detect_ai_media_image_logic(file_path, l1_data, trusted_metadata=trusted_metadata, original_filename=original_filename)
 
-    # --- EXIF Extraction ---
-    file_size = 0
+async def detect_ai_media_image_logic(file_path: Optional[str], l1_data: dict = None, frame: Image.Image = None, trusted_metadata: dict = None, original_filename: str = None) -> dict:
+    layer_start = time.perf_counter()
     if frame:
-        img_for_res = frame
-        exif = {} 
-        source_for_hash = frame
-        width, height = img_for_res.size
+        img_pil = frame
+        exif = {}
+        width, height = img_pil.size
+        file_size = 0
     else:
         exif = get_exif_data(file_path)
-        try:
-            with Image.open(file_path) as img:
-                width, height = img.size
-            source_for_hash = file_path
-            file_size = os.path.getsize(file_path)
-        except:
-            return {
-                "summary": "Analysis Failed",
-                "confidence_score": 0.0,
-                "layers": {
-                    "layer1_metadata": l1_data,
-                    "layer2_forensics": {"status": "error", "probability": 0.0, "signals": ["Invalid image file"]}
-                }
-            }
-    
-    # --- Merge Trusted Metadata (Sidecar) ---
+        img_pil = Image.open(file_path)
+        width, height = img_pil.size
+        file_size = os.path.getsize(file_path)
+
     if trusted_metadata:
-        logger.info(f"[SIDECAR] Using trusted metadata from device")
-        if "Make" in trusted_metadata: exif["Make"] = trusted_metadata["Make"]
-        if "Model" in trusted_metadata: exif["Model"] = trusted_metadata["Model"]
-        if "Software" in trusted_metadata: exif["Software"] = trusted_metadata["Software"]
-        if "DateTime" in trusted_metadata: exif["DateTimeOriginal"] = trusted_metadata["DateTime"]
+        for k, v in trusted_metadata.items():
+            if k in ["Make", "Model", "Software", "DateTime"]: exif[k] = v
         if "width" in trusted_metadata: width = trusted_metadata["width"]
         if "height" in trusted_metadata: height = trusted_metadata["height"]
         if "fileSize" in trusted_metadata: file_size = trusted_metadata["fileSize"]
-        # In-app capture marker (used for scoring/auditing)
-        if trusted_metadata.get("captured_in_app") is True:
-            exif["CapturedInApp"] = True
-            exif["CaptureSessionId"] = trusted_metadata.get("capture_session_id")
-            exif["CaptureTimestampMs"] = trusted_metadata.get("capture_timestamp_ms") or trusted_metadata.get("capture_timestamp")
-            
-    # --- Metadata Scoring ---
-    human_score, human_signals = get_forensic_metadata_score(exif)
-    effective_filename = original_filename or os.path.basename(file_path if file_path else "")
-    ai_score, ai_signals = get_ai_suspicion_score(exif, width, height, file_size, filename=effective_filename)
-    
-    logger.debug(f"[DEBUG] meta scores - human: {human_score} ({type(human_score)}), ai: {ai_score} ({type(ai_score)})")
 
-    meta_summary = {
-        "human_score": float(human_score),
-        "ai_score": float(ai_score),
-        "signals": [str(s) for s in (human_signals or [])][:10] + [str(s) for s in (ai_signals or [])][:10],
-        "extracted": {
-            "make": exif.get("Make"),
-            "model": exif.get("Model"),
-            "software": exif.get("Software"),
-            "has_icc": bool(exif.get("HasICCProfile")),
-            "has_makernote": bool(exif.get("HasMakerNote") or exif.get("MakerNote")),
-            "has_embedded_thumbnail": bool(exif.get("HasEmbeddedThumbnail")),
-            "jpeg_qtable_generic": bool(exif.get("JPEGQuantIsGeneric")),
-            "dct_midhigh_ratio": exif.get("DCTMidHighRatio"),
-            "width": width,
-            "height": height,
-            "file_size": file_size,
-            "filename": effective_filename,
-        },
-        "bypass_reason": None,
-    }
+    m_h, h_signals = get_forensic_metadata_score(exif)
+    m_ai, ai_signals = get_ai_suspicion_score(exif, width, height, file_size)
 
-    # 1. VERIFIED ORIGINAL (Early Exit - Save Money)
-    if human_score >= ScoringConfig.THRESHOLDS["HUMAN_EXIT_HIGH"]:
-        return _log_decision({
-            "summary": "Verified Original (Metadata)",
-            "confidence_score": 0.99,
-            "layers": {
-                "layer1_metadata": {
-                    "status": "verified_original", 
-                    "provider": exif.get("Make", "Unknown"),
-                    "description": "Device metadata verified - real camera footprint."
-                },
-                "layer2_forensics": {
-                    "status": "skipped", "probability": 0.0, "signals": human_signals
-                 }
-            },
-            "gpu_time_ms": 0,
-            "gpu_bypassed": True,
-            "metadata": {**meta_summary, "bypass_reason": "metadata_verified_original"}
-        }, "Metadata (Verified)")
+    # --- 1. DUAL-GATE METADATA (RUN 30) ---
+    if m_h > PROD_CONFIG['dual_gate_metadata']['human_threshold']:
+        return {
+            "summary": "Verified Human (Metadata)", "confidence_score": 1.0,
+            "layers": {"layer1_metadata": {"status": "verified_human", "signals": h_signals}, "layer2_forensics": {"status": "skipped"}}
+        }
+    if m_ai > PROD_CONFIG['dual_gate_metadata']['ai_threshold']:
+        return {
+            "summary": "Verified AI (Metadata)", "confidence_score": 1.0,
+            "layers": {"layer1_metadata": {"status": "verified_ai", "signals": ai_signals}, "layer2_forensics": {"status": "skipped"}}
+        }
 
-    # 2. LIKELY ORIGINAL (Early Exit - Save Money)
-    # Be aggressive if ai_score is very low
-    if (
-        (human_score >= ScoringConfig.THRESHOLDS["HUMAN_EXIT_LOW"] and ai_score < ScoringConfig.THRESHOLDS.get("HUMAN_LOW_AI_MAX", 0.10))
-        or (ai_score == 0 and human_score >= ScoringConfig.THRESHOLDS.get("HUMAN_LOW_NO_AI_MIN", 0.25))
-    ):
-        return _log_decision({
-            "summary": "Likely Original (Metadata)",
-            "confidence_score": 0.9,
-            "layers": {
-                "layer1_metadata": {
-                    "status": "likely_original", 
-                    "provider": exif.get("Make", "Unknown"),
-                    "description": "Heuristic analysis suggests original source."
-                },
-                "layer2_forensics": {
-                    "status": "skipped", "probability": 0.1, "signals": human_signals
-                 }
-            },
-            "gpu_time_ms": 0,
-            "gpu_bypassed": True,
-            "metadata": {**meta_summary, "bypass_reason": "metadata_likely_original"}
-        }, "Metadata (Likely Original)")
-
-    # 3. LIKELY AI (Early Exit - Save Money)
-    if ai_score >= ScoringConfig.THRESHOLDS["AI_EXIT_META"]:
-        return _log_decision({
-            "summary": "Likely AI (Metadata Evidence)",
-            "confidence_score": 0.95,
-            "layers": {
-                "layer1_metadata": {
-                    "status": "verified_ai", 
-                    "provider": exif.get("Software", "AI Generator"),
-                    "description": "Image metadata contains known AI signatures."
-                },
-                "layer2_forensics": {
-                    "status": "skipped", "probability": 0.95, "signals": ai_signals
-                 }
-            },
-            "gpu_time_ms": 0,
-            "gpu_bypassed": True,
-            "metadata": {**meta_summary, "bypass_reason": "metadata_likely_ai"}
-        }, "Metadata (Likely AI)")
-
-    # 4. SUSPICIOUS AI (Continue to GPU)
-    # We no longer exit early here to let the GPU 'veto' suspicious metadata
-    # as requested: "always assume that the gpu is gives u the correct answer"
-    is_suspicious_meta = ai_score >= ScoringConfig.THRESHOLDS["AI_SUSPICIOUS"] and human_score == 0.0
-    
-    # 5. GPU Verification
-    img_for_gpu = frame if frame else source_for_hash
-    if not frame and os.path.exists(file_path):
-        f_size = os.path.getsize(file_path)
-        if f_size > 50 * 1024 * 1024:
-            return {
-                "summary": "File too large to scan", 
-                "confidence_score": 0.0, 
-                "layers": {
-                    "layer1_metadata": {"status": "not_found", "provider": None, "description": "Size limit"},
-                    "layer2_forensics": {"status": "skipped", "probability": 0.0, "signals": ["Skipped"]}
-                }
-            }
-
-    # --- Consensus Preparation ---
-    final_signals = ["Multi-layered consensus applied (Deep Learning + FFT)"]
-    forensic_probability = 0.0
-    actual_gpu_time_ms = 0.0
-
-    # --- Forensic Cache Lookup ---
-    file_hash = get_image_hash(file_path) if file_path else None
-    if file_hash and not _benchmark_mode_enabled():
-        cached_result = forensic_cache.get(file_hash)
-        if cached_result:
-            logger.info(f"[CACHE] Hit for {original_filename if original_filename else file_path}")
-            return cached_result
-
-    # --- GPU Scan (Production) ---
-    actual_gpu_time_ms = 0.0
-    start_gpu = time.perf_counter()
-    
-    # Actual GPU call via RunPod client
-    if file_path:
-        gpu_source = file_path
-    elif frame is not None:
-        if np is None:
-            raise RuntimeError("numpy is required for frame-based GPU scan but is not installed")
-        gpu_source = Image.fromarray(np.uint8(frame))
+    # --- 2. GPU SCAN ---
+    img_hash = get_image_hash(img_pil if frame else file_path, fast_mode=(frame is not None))
+    cached = forensic_cache.get(img_hash)
+    if cached:
+        logger.info(f"[CACHE] Hit for {original_filename or file_path}")
+        scores = cached["scores"]
+        gpu_time = 0
     else:
-        gpu_source = ""
+        forensic_res = await run_deep_forensics(img_pil if frame else file_path, width, height)
+        scores = forensic_res.get("scores", {"A": 0.5, "B": 0.5, "TruFor": 0.5})
+        gpu_time = forensic_res.get("gpu_time_ms", 0)
+        forensic_cache.put(img_hash, {"scores": scores})
 
-    gpu_result = await run_deep_forensics(gpu_source)
-    
-    forensic_probability = gpu_result.get("ai_score", 0.0)
-    actual_gpu_time_ms = gpu_result.get("gpu_time_ms", 0.0)
-    model_breakdown = gpu_result.get("model_breakdown", {})
-    
-    gpu_signals = [f"Forensic models scanned (Score: {forensic_probability:.2f})"]
-    if gpu_result.get("error"):
-        gpu_signals.append(f"GPU Error: {gpu_result['error']}")
-    
-    final_signals.extend(gpu_signals)
+    # --- 3. RUN 30 ENSEMBLE CONSENSUS ---
+    ext = Path(file_path).suffix.lower() if file_path else ".jpg"
+    pixels = width * height
+    aspect = width / height if height != 0 else 1.0
+    slice_name = get_slice_name(pixels, width, height, ext, aspect)
+    p = PROD_CONFIG['slices'].get(slice_name, PROD_CONFIG['slices']['default'])
 
-    # --- Metadata-Model Conflict Resolution ---
-    original_prob = forensic_probability
+    l_a, l_b, l_t = logit(scores['A']), logit(scores['B']), logit(scores['TruFor'])
+    l_total = (p['wA'] * l_a) + (p['wB'] * l_b) + (p['wT'] * l_t)
     
-    # HARD AI SIGNALS (Keywords) always push the score up even if GPU is low
-    ai_signals_str = " ".join(ai_signals).lower()
-    hard_ai_signal = any(k in ai_signals_str for k in ["keyword", "software", "manufacturer", "filename", "marker", "credit"])
-    
-    if (
-        (not _benchmark_mode_enabled())
-        and ai_score >= ScoringConfig.THRESHOLDS["CONFLICT_AI_SCORE"]
-        and forensic_probability < ScoringConfig.THRESHOLDS["CONFLICT_MODEL_LOW"]
-    ):
-        if hard_ai_signal:
-            # Hard evidence overrides silent GPU
-            forensic_probability = max(forensic_probability, ai_score, 0.95)
-            final_signals.append(f"Hard AI Metadata evidence verified ({ai_score}) - overriding silent forensics")
-        else:
-            # Soft suspicion (meta-data absence) blends with GPU
-            # Refinement (Round 2): (ai * 0.6) + (gpu * 0.4)
-            blended_prob = (float(ai_score) * 0.60) + (float(forensic_probability) * 0.40)
-            forensic_probability = blended_prob
-            final_signals.append(f"Consensus blend: Suspicious metadata ({ai_score}) + Forensic consensus")
-    
-    l2_data = {
-        "status": "detected" if forensic_probability > 0.85 else "suspicious" if forensic_probability > 0.5 else "not_detected",
-        "probability": round(forensic_probability, 4),
-        "signals": final_signals
-    }
-    
-    is_ai_likely = forensic_probability > 0.5
-    logger.debug(f"[DEBUG] Prob: {forensic_probability}, LIKELY_AI: {ScoringConfig.THRESHOLDS['LIKELY_AI']}, POSSIBLE: {ScoringConfig.THRESHOLDS['POSSIBLE_AI']}")
-    
-    if forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_AI"]: summary = "Likely AI"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["POSSIBLE_AI"]: summary = "Possible AI"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["SUSPICIOUS_AI"]: summary = "Uncertain / Suspicious"
-    elif forensic_probability > ScoringConfig.THRESHOLDS["LIKELY_HUMAN_NOISE"]: summary = "Likely Original (Low Confidence)"
-    else: summary = "Likely Original"
+    l_final = l_total
+    # Metadata Gating (Tau)
+    if abs(l_total) < p['tau']:
+        meta_signal = m_ai - m_h
+        l_final = (p['alpha'] * l_total) + ((1 - p['alpha']) * meta_signal)
 
-    logger.debug(f"[DEBUG] Summary chosen: {summary}")
+    # --- 4. FINAL VERDICT ---
+    verdict_is_ai = l_final > p['margin']
+    final_p = 1 / (1 + math.exp(-l_final))
     
-    raw_conf = forensic_probability if is_ai_likely else (1.0 - forensic_probability)
-    final_conf = boost_score(raw_conf, is_ai_likely=is_ai_likely)
-    if final_conf > 0.99: final_conf = 0.99
+    # Suspicion Window
+    is_suspicious = abs(l_final - p['margin']) < PROD_CONFIG['suspicion']['window']
     
-    # Calculate G-Score for logging
-    g_score_log = round(forensic_probability, 2)
-
-    final_result = {
+    summary = "Likely AI" if verdict_is_ai else "Likely Human"
+    if is_suspicious: summary = "Suspicious (Uncertain)"
+    
+    return {
         "summary": summary,
-        "confidence_score": round(final_conf, 2),
+        "confidence_score": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
+        "suspicious": is_suspicious,
         "layers": {
-            "layer1_metadata": l1_data, 
-            "layer2_forensics": l2_data
+            "layer1_metadata": {"human_score": m_h, "ai_score": m_ai, "signals": ai_signals + h_signals},
+            "layer2_forensics": {"status": "detected" if verdict_is_ai else "not_detected", "scores": scores, "slice": slice_name}
         },
-        "gpu_time_ms": actual_gpu_time_ms,
-        "gpu_bypassed": actual_gpu_time_ms == 0,
-        "metadata": meta_summary
+        "gpu_time_ms": gpu_time
     }
-
-    if file_hash and not _benchmark_mode_enabled():
-        forensic_cache.put(file_hash, final_result)
-        
-    # Log G-Score explicitly
-    try:
-        if "layers" in final_result and "layer1_metadata" in final_result["layers"]:
-            h_score = meta_summary.get("human_score", 0.0)
-            a_score = meta_summary.get("ai_score", 0.0)
-            logger.info(f"[DECISION] Verdict: {summary} ({final_conf:.2f}) | Source: Final Consensus | Scores: H={h_score}, A={a_score}, G={g_score_log} | Models: {model_breakdown}")
-            # Skip the helper _log_decision since we logged it manually with G-score
-            return final_result
-    except: pass
-
-    return _log_decision(final_result, "Final Consensus")

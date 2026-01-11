@@ -3,7 +3,6 @@ uvicorn
 python-multipart
 python-dotenv
 aiohttp
-requests
 runpod
 pillow
 numpy

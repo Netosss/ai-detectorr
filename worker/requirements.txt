@@ -6,3 +6,5 @@ timm
 numpy<2
 safetensors
 opencv-python-headless
+yacs
+matplotlib

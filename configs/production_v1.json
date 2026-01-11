@@ -1,0 +1,95 @@
+{
+    "dual_gate_metadata": {
+        "human_threshold": 0.5,
+        "ai_threshold": 0.8
+    },
+    "slices": {
+        "default": {
+            "wA": 0.27,
+            "wB": 0.0,
+            "wT": 0.73,
+            "alpha": 0.0,
+            "tau": 0.05,
+            "margin": -0.5
+        },
+        "jpgjpeg": {
+            "wA": 0.27,
+            "wB": 0.0,
+            "wT": 0.73,
+            "alpha": 0.0,
+            "tau": 0.05,
+            "margin": -0.5
+        },
+        "png": {
+            "wA": 0.18,
+            "wB": 0.12,
+            "wT": 0.7,
+            "alpha": 0.3,
+            "tau": 0.2,
+            "margin": 0.2
+        },
+        "thumbnail": {
+            "wA": 0.55,
+            "wB": 0.0,
+            "wT": 0.45,
+            "alpha": 1.0,
+            "tau": 0.05,
+            "margin": 0.0,
+            "ba": 0.550320321840692
+        },
+        "low_res": {
+            "wA": 0.33,
+            "wB": 0.33,
+            "wT": 0.34,
+            "alpha": 0.5,
+            "tau": 0.1,
+            "margin": 0.0
+        },
+        "10k-50k": {
+            "wA": 0.0,
+            "wB": 0.0,
+            "wT": 1.0,
+            "alpha": 0.0,
+            "tau": 0.05,
+            "margin": -0.5
+        },
+        "50k-500k": {
+            "wA": 0.3,
+            "wB": 0.0,
+            "wT": 0.7,
+            "alpha": 0.6,
+            "tau": 0.2,
+            "margin": 0.2,
+            "ba": 0.7560381550251717
+        },
+        ">500k": {
+            "wA": 0.2,
+            "wB": 0.1,
+            "wT": 0.7,
+            "alpha": 1.0,
+            "tau": 0.05,
+            "margin": 0.0,
+            "ba": 0.8011198052883846
+        },
+        "squareish": {
+            "wA": 0.24,
+            "wB": 0.0,
+            "wT": 0.76,
+            "alpha": 0.0,
+            "tau": 0.05,
+            "margin": -0.5
+        },
+        "portrait_tall": {
+            "wA": 0.25,
+            "wB": 0.01,
+            "wT": 0.74,
+            "alpha": 1.0,
+            "tau": 0.05,
+            "margin": 0.0
+        }
+    },
+    "suspicion": {
+        "window": 0.1,
+        "center": "margin"
+    }
+}

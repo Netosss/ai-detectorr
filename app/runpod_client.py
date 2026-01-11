@@ -56,10 +56,11 @@ def get_config():
         "webhook_url": os.getenv("RUNPOD_WEBHOOK_URL"),  # e.g., https://your-api.com/webhook/runpod
     }
 
-def optimize_image(source: Union[str, Image.Image], max_size: int = 512) -> tuple:
+def optimize_image(source: Union[str, Image.Image], max_size: int = 1024) -> tuple:
     """
     Optimizes image for transfer. Accepts file path or PIL Image.
     Returns: (base64_string, width, height)
+    Preserves enough detail for TruFor and Run 30 forensics.
     """
     try:
         if isinstance(source, str):
@@ -68,7 +69,7 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 512) -> tupl
             img = source
 
         orig_w, orig_h = img.size
-        # Resize if larger than max_size
+        # Resize if larger than max_size (1024 is the Run 30 sweet spot)
         if max(orig_w, orig_h) > max_size:
             img.thumbnail((max_size, max_size))
         
@@ -76,7 +77,8 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 512) -> tupl
             img = img.convert("RGB")
         
         buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
+        # High quality JPEG to preserve noise patterns for Model B interrogation
+        img.save(buffer, format="JPEG", quality=95)
         
         # Close handle if we opened it from path
         if isinstance(source, str):
@@ -91,11 +93,11 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 512) -> tupl
 async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, height: int = 0) -> Dict[str, Any]:
     """
     Offloads forensic scan to RunPod. Supports webhooks (fast) or polling (fallback).
-    Returns: dict with 'ai_score' and 'gpu_time_ms' for accurate cost calculation.
+    Returns: dict with raw model scores and metadata for consensus.
     """
     config = get_config()
     if not config["endpoint_id"]:
-        return {"ai_score": 0.0, "gpu_time_ms": 0.0}
+        return {"scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}, "gpu_time_ms": 0.0}
 
     try:
         total_start = time.perf_counter()
@@ -105,7 +107,7 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         
         # In-memory optimization (No Disk!)
         t_opt = time.perf_counter()
-        image_base64, w, h = optimize_image(source, max_size=512)
+        image_base64, w, h = optimize_image(source, max_size=1024)
         opt_time_ms = (time.perf_counter() - t_opt) * 1000
         payload_size_kb = len(image_base64) / 1024
         logger.info(f"[TIMING] Image optimization: {opt_time_ms:.2f}ms | Payload: {payload_size_kb:.1f}KB")
@@ -118,6 +120,7 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
             "image": image_base64,
             "original_width": final_w,
             "original_height": final_h,
+            "is_png": str(source).lower().endswith(".png") if isinstance(source, str) else False,
             "task": "deep_forensic"
         }
 
@@ -125,13 +128,9 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         webhook_url = config.get("webhook_url")
         
         if webhook_url:
-            # ---- WEBHOOK MODE (Fast!) ----
-            # Webhook URL goes inside the payload per RunPod docs:
-            # https://docs.runpod.io/serverless/endpoints/send-requests#webhook-notifications
             job_result = await _run_with_webhook(endpoint, payload, webhook_url, timeout_seconds=90)
             mode = "webhook"
         else:
-            # ---- POLLING MODE (Fallback) ----
             job_result = await _run_with_polling(endpoint, payload, timeout_seconds=90)
             mode = "polling"
         
@@ -144,28 +143,24 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
             worker_timing = job_result["timing_ms"]
             gpu_time_ms = worker_timing.get("total", 0.0)
             logger.info(f"[TIMING] Worker breakdown: {worker_timing}")
-            overhead_ms = api_time_ms - gpu_time_ms
-            logger.info(f"[TIMING] Network overhead ({mode}): {overhead_ms:.2f}ms")
 
         logger.info(f"[TIMING] RunPod API call ({mode}): {api_time_ms:.2f}ms | Total: {total_time_ms:.2f}ms")
 
-        # Check for errors in result
         if job_result and "error" in job_result:
             logger.warning(f"[RUNPOD] Job returned error: {job_result['error']}")
         
-        ai_score = float(job_result.get("ai_score", 0.0)) if job_result else 0.0
+        # New Run 30 Return Schema
+        scores = job_result.get("scores", {"A": 0.5, "B": 0.5, "TruFor": 0.5})
         
         return {
-            "ai_score": ai_score,
+            "scores": scores,
             "gpu_time_ms": gpu_time_ms,
-            "model_score": job_result.get("model_score", ai_score) if job_result else ai_score,
-            "model_breakdown": job_result.get("model_breakdown", {}) if job_result else {},
             "error": job_result.get("error") if job_result else None
         }
     except Exception as e:
         error_msg = f"RunPod call failed: {str(e)}"
         logger.error(f"[RUNPOD] {error_msg}", exc_info=True)
-        return {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": error_msg}
+        return {"scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}, "gpu_time_ms": 0.0, "error": error_msg}
 
 
 def _batch_encode_images(frames: list) -> list:
