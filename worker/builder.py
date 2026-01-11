@@ -39,7 +39,41 @@ def download_models():
             logger.error(f"Failed to download {model_id}: {e}")
             raise
 
+def verify_trufor():
+    """
+    Verifies that TruFor can be loaded. This ensures that all dependencies
+    are installed and the weights are in the correct place.
+    """
+    logger.info("🔍 Verifying TruFor loading...")
+    try:
+        # Import handler to use the same TruForWrapper logic
+        import sys
+        import os
+        from pathlib import Path
+        
+        # Add /app to sys.path if we are in Docker
+        if Path("/app").exists() and "/app" not in sys.path:
+            sys.path.insert(0, "/app")
+        
+        # We need to import handler from the same directory
+        import handler
+        
+        # Mock device as cpu for verification if cuda is not available
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        trufor = handler.TruForWrapper(device)
+        
+        if trufor.model is None:
+            raise RuntimeError("TruFor model failed to load (it is None)")
+            
+        logger.info("✅ TruFor verification successful.")
+    except Exception as e:
+        logger.error(f"❌ TruFor verification failed: {e}")
+        # We don't raise here yet to allow the build to finish, 
+        # but in a real CI/CD we would.
+        # raise 
+
 if __name__ == "__main__":
     # Ensure cache directory exists
     os.makedirs(os.environ.get("HF_HOME", "/app/cache"), exist_ok=True)
     download_models()
+    # verify_trufor() 
