@@ -10,6 +10,7 @@ import cv2
 import concurrent.futures
 import os
 import sys
+from pathlib import Path
 from collections import OrderedDict
 from PIL import Image, ImageFilter
 from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -216,21 +217,21 @@ class RouterClassifier:
                 self.trufor = f_t.result()
 
             # --- Optimizations ---
-            # Applying torch.compile BEFORE warmup ensures the 30s delay happens on boot, not handled by the user
+            # NOTE: torch.compile is disabled for Model A/B due to FX conflict with transformers 4.48+
+            # on PyTorch 2.2.1. FP16 + channels_last provides enough speed on RTX 4090.
             if hasattr(torch, 'compile') and self.device == "cuda":
-                logger.info("🛠 Optimizing models (torch.compile)...")
-                try:
-                    self.model_a = torch.compile(self.model_a, mode="default")
-                    self.model_b = torch.compile(self.model_b, mode="default")
-                except Exception as ce:
-                    logger.warning(f"Could not compile: {ce}")
+                logger.info("🛠 Skipping torch.compile to avoid FX conflict (stability fix).")
+                # try:
+                #     self.model_a = torch.compile(self.model_a, mode="default")
+                #     self.model_b = torch.compile(self.model_b, mode="default")
+                # except Exception as ce:
+                #     logger.warning(f"Could not compile: {ce}")
 
-            # Warmup (IMPORTANT: Moves 4090 initialization/compilation to boot phase)
-            logger.info("🔥 RTX 4090: Hard-warming inference engines (moving JIT to boot)...")
+            # Warmup (IMPORTANT: Moves 4090 initialization to boot phase)
+            logger.info("🔥 RTX 4090: Hard-warming inference engines...")
             dummy = Image.new('RGB', (224, 224), color='white')
-            # Run multiple warmups to ensure cuDNN benchmarks are settled
-            for _ in range(2):
-                self.predict_batch([dummy])
+            # 1 pass is enough to initialize CUDA context and cuDNN
+            self.predict_batch([dummy])
             
             boot_ms = (time.perf_counter() - t_boot_start) * 1000
             self.models_loaded = True
@@ -245,6 +246,8 @@ class RouterClassifier:
         proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
+        if self.device == "cuda":
+            model = model.to(memory_format=torch.channels_last)
         return model, proc
 
     def _init_model_b(self):
@@ -252,6 +255,8 @@ class RouterClassifier:
         proc = AutoImageProcessor.from_pretrained(mid, use_fast=True)
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
+        if self.device == "cuda":
+            model = model.to(memory_format=torch.channels_last)
         return model, proc
 
     def _get_ai_idx(self, model):
@@ -359,7 +364,6 @@ class RouterClassifier:
             })
         return final_results
 
-from pathlib import Path
 classifier = RouterClassifier()
 decode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
