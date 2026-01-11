@@ -71,14 +71,27 @@ class TruForWrapper:
         
         # --- Direct Path Resolution (Optimized for RunPod) ---
         repo_root = Path("/app")
-        trufor_path = repo_root / "third_party/grip/TruFor/TruFor_train_test"
         
-        # Local fallback if not in Docker
-        if not trufor_path.exists():
-            trufor_path = Path(__file__).resolve().parent / "third_party/grip/TruFor/TruFor_train_test"
+        # Try multiple possible path structures (Docker COPY can be tricky)
+        possible_paths = [
+            repo_root / "third_party/grip/TruFor/TruFor_train_test",
+            repo_root / "grip/TruFor/TruFor_train_test",
+            Path(__file__).resolve().parent / "third_party/grip/TruFor/TruFor_train_test"
+        ]
+        
+        trufor_path = None
+        for p in possible_paths:
+            if (p / "lib").exists():
+                trufor_path = p
+                break
             
-        if not trufor_path.exists():
-            logger.error(f"❌ TruFor path not found at {trufor_path}")
+        if not trufor_path:
+            logger.error(f"❌ TruFor path not found. Checked: {[str(p) for p in possible_paths]}")
+            # Debug: what is in /app?
+            try:
+                if repo_root.exists():
+                    logger.info(f"Contents of /app: {[str(x.name) for x in repo_root.iterdir()]}")
+            except: pass
             return
 
         # Add both the folder and its parent to be safe
