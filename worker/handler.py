@@ -100,10 +100,15 @@ class TruForWrapper:
             logger.error("Failed to locate TruFor lib in any expected path.")
             # Debug: List what we DO have
             try:
-                if (repo_root / "third_party").exists():
-                    logger.info(f"Contents of {repo_root / 'third_party'}:")
-                    for item in (repo_root / "third_party").iterdir():
+                base_p = repo_root / "third_party"
+                if base_p.exists():
+                    logger.info(f"Contents of {base_p}:")
+                    for item in base_p.iterdir():
                         logger.info(f"  - {item}")
+                        if "grip" in str(item).lower() and item.is_dir():
+                            logger.info(f"    Contents of {item}:")
+                            for sub in item.iterdir():
+                                logger.info(f"      -- {sub}")
             except Exception as le:
                 logger.error(f"Could not list directory: {le}")
             return
