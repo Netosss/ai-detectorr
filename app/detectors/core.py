@@ -280,7 +280,17 @@ async def detect_ai_media(file_path: str, trusted_metadata: dict = None, origina
             }
         loop = asyncio.get_running_loop()
         frames, _ = await loop.run_in_executor(None, extract_video_frames, file_path)
-        if not frames: return {"summary": "Analysis Failed", "confidence_score": 0.0}
+        if not frames: 
+            return {
+                "summary": "Analysis Failed", 
+                "confidence_score": 0.0,
+                "suspicious": False,
+                "gpu_bypassed": False,
+                "layers": {
+                    "layer1_metadata": {"status": "not_found", "description": "Video frame extraction failed."},
+                    "layer2_forensics": {"status": "skipped"}
+                }
+            }
         from app.runpod_client import run_batch_forensics
         batch_result = await run_batch_forensics(frames)
         probs = [r.get("ai_score", 0.0) for r in batch_result.get("results", [])]
@@ -289,7 +299,14 @@ async def detect_ai_media(file_path: str, trusted_metadata: dict = None, origina
             "summary": "Likely AI" if final_p > 0.5 else "Likely Human", 
             "confidence_score": round(final_p, 2),
             "suspicious": (0.4 <= final_p <= 0.6), # Simple suspicion logic for video
-            "gpu_bypassed": False
+            "gpu_bypassed": False,
+            "layers": {
+                "layer1_metadata": {"status": "not_found", "description": "Video pixels analyzed via frame sampling."},
+                "layer2_forensics": {
+                    "status": "detected" if final_p > 0.5 else "not_detected",
+                    "probability": round(final_p, 2)
+                }
+            }
         }
     
     return await detect_ai_media_image_logic(file_path, l1_data, trusted_metadata=trusted_metadata, original_filename=original_filename)
@@ -392,9 +409,19 @@ async def detect_ai_media_image_logic(file_path: Optional[str], l1_data: dict = 
         "summary": summary,
         "confidence_score": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
         "suspicious": is_suspicious,
+        "gpu_bypassed": False,
         "layers": {
-            "layer1_metadata": {"human_score": m_h, "ai_score": m_ai, "signals": ai_signals + h_signals},
-            "layer2_forensics": {"status": "detected" if verdict_is_ai else "not_detected", "scores": scores, "slice": slice_name}
+            "layer1_metadata": {
+                "status": "not_found",
+                "human_score": m_h, 
+                "ai_score": m_ai, 
+                "signals": ai_signals + h_signals
+            },
+            "layer2_forensics": {
+                "status": "detected" if verdict_is_ai else "not_detected",
+                "probability": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
+                "signals": [f"Slice: {slice_name}"]
+            }
         },
         "gpu_time_ms": gpu_time
     }
