@@ -23,15 +23,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Import from new modular structure
+# Import from modular structure
 from app.detectors import detect_ai_media
 from app.schemas import DetectionResponse
-from app.runpod_client import run_video_removal, pending_jobs, webhook_result_buffer, cleanup_stale_jobs
+from app.runpod_client import run_video_removal
 from app.security import security_manager
-from contextlib import asynccontextmanager
-
-# Webhook authentication secret (set via environment variable)
-RUNPOD_WEBHOOK_SECRET = os.getenv("RUNPOD_WEBHOOK_SECRET", "")
 
 # Dashboard authentication (optional but recommended)
 DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "")
@@ -39,42 +35,7 @@ DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "")
 # Setup Jinja2 Templates
 templates = Jinja2Templates(directory="app/templates")
 
-# Background cleanup task
-cleanup_task = None
-
-async def periodic_cleanup():
-    """Background task to clean up stale pending jobs every 30 seconds."""
-    while True:
-        try:
-            await asyncio.sleep(30)
-            cleanup_stale_jobs()
-            logger.debug("[CLEANUP] Periodic cleanup completed")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"[CLEANUP] Error in periodic cleanup: {e}")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    global cleanup_task
-    # Startup: start background cleanup
-    cleanup_task = asyncio.create_task(periodic_cleanup())
-    logger.info("[STARTUP] Background cleanup task started")
-    yield
-    # Shutdown: cancel cleanup task
-    if cleanup_task:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-    logger.info("[SHUTDOWN] Background cleanup task stopped")
-
-app = FastAPI(title="AI Provenance & Cleansing API", lifespan=lifespan)
-
-# ---- RunPod Webhook Storage ----
-# This is imported from runpod_client and shared
+app = FastAPI(title="AI Provenance & Cleansing API")
 
 USAGE_LOG = "usage_log.csv"
 
@@ -119,74 +80,6 @@ app.add_middleware(
 async def health():
     return {"status": "healthy"}
 
-# ---- RunPod Webhook Endpoint ----
-@app.post("/webhook/runpod")
-async def runpod_webhook(request: Request):
-    """
-    Receives webhook callbacks from RunPod when jobs complete.
-    This eliminates polling and provides instant results.
-    
-    Security: Validates X-Runpod-Signature header if RUNPOD_WEBHOOK_SECRET is set.
-    """
-    try:
-        # ---- Authentication ----
-        if RUNPOD_WEBHOOK_SECRET:
-            signature = (
-                request.headers.get("X-Runpod-Signature", "") or
-                request.headers.get("Authorization", "").replace("Bearer ", "") or
-                request.headers.get("X-Webhook-Secret", "")
-            )
-            
-            if signature != RUNPOD_WEBHOOK_SECRET:
-                logger.warning(f"[WEBHOOK] Signature mismatch.")
-                # For now, log but don't block
-        
-        payload = await request.json()
-        job_id = payload.get("id")
-        status = payload.get("status")
-        output = payload.get("output")
-        
-        logger.info(f"[WEBHOOK] Callback received: job={job_id}, status={status}")
-        if output:
-            # Mask base64 or long data if present, but show keys
-            out_keys = list(output.keys()) if isinstance(output, dict) else "non-dict"
-            logger.info(f"[WEBHOOK] Output keys: {out_keys}")
-        
-        if job_id and job_id in pending_jobs:
-            future, start_time = pending_jobs[job_id]
-            
-            if status == "COMPLETED" and output:
-                # Accept anything that is a dictionary from the worker
-                if not isinstance(output, dict):
-                    logger.warning(f"[WEBHOOK] Job {job_id} output is not a dict: {type(output)}")
-                
-                if not future.done():
-                    future.set_result(output)
-            elif status == "FAILED":
-                error_output = {
-                    "error": "Job failed", 
-                    "details": payload.get("error")
-                }
-                if not future.done():
-                    future.set_result(error_output)
-            else:
-                return {"status": "acknowledged"}
-        elif job_id and status == "COMPLETED" and output:
-            # Buffer for race conditions (webhook arrives before job is tracked)
-            # OR multi-process scenarios (webhook arrives at different worker)
-            if isinstance(output, dict):
-                webhook_result_buffer[job_id] = (output, time.time())
-                from app.runpod_client import buffer_result_to_disk
-                buffer_result_to_disk(job_id, output)
-                logger.info(f"[WEBHOOK] Job {job_id} buffered (Early arrival saved to disk)")
-            else:
-                logger.warning(f"[WEBHOOK] Job {job_id} has non-dict output, ignoring buffer: {type(output)}")
-        
-        return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Error processing callback: {e}")
-        return {"status": "error", "message": str(e)}
-
 # ---- Dashboard endpoint ----
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, secret: str = ""):
@@ -199,7 +92,6 @@ async def dashboard(request: Request, secret: str = ""):
                 "error": "Access Denied. Add ?secret=YOUR_SECRET to the URL."
             }, status_code=401)
     
-    # 1. Check if log exists
     if not os.path.exists(USAGE_LOG):
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
@@ -207,7 +99,6 @@ async def dashboard(request: Request, secret: str = ""):
         })
 
     try:
-        # 2. Read and Validate Data
         df = pd.read_csv(USAGE_LOG)
         if df.empty:
             return templates.TemplateResponse("dashboard.html", {
@@ -215,16 +106,12 @@ async def dashboard(request: Request, secret: str = ""):
                 "is_empty": True
             })
             
-        # Ensure timestamp is numeric
         df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
         df = df.dropna(subset=['timestamp'])
-        
-        # Pre-processing
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
         df['date_label'] = df['datetime'].dt.strftime('%H:%M:%S')
         df = df.sort_values('timestamp')
 
-        # 3. Create Scatter Plot
         fig = px.scatter(
             df, x="datetime", y="cost_usd", color="method",
             text="request_id",
@@ -257,10 +144,7 @@ async def dashboard(request: Request, secret: str = ""):
         )
 
         plot_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-
-        # Convert DF to list of dicts for Jinja2
         rows = df.tail(10).iloc[::-1].to_dict(orient="records")
-        
         total_cost = df['cost_usd'].sum()
         total_requests = len(df)
 
@@ -309,8 +193,6 @@ async def detect(
     request: Request, 
     file: UploadFile = File(...),
     trusted_metadata: Optional[str] = Form(None),
-    # Capture-time sidecar fields (sent by mobile app)
-    # Using Optional[str] for robustness against empty or malformed values from mobile clients
     captured_in_app: Optional[str] = Form(None),
     capture_session_id: Optional[str] = Form(None),
     capture_timestamp_ms: Optional[str] = Form(None),
@@ -320,50 +202,31 @@ async def detect(
     """
     Detect AI-generated content in images/videos.
     """
-    # Parse trusted metadata sidecar if provided
-    sidecar_metadata = None
+    sidecar_metadata = {}
     if trusted_metadata:
         try:
             sidecar_metadata = json.loads(trusted_metadata)
-            logger.info(f"[SIDECAR] Received trusted metadata: {list(sidecar_metadata.keys())}")
-        except json.JSONDecodeError as e:
-            logger.warning(f"[SIDECAR] Invalid JSON in trusted_metadata: {e}")
+        except json.JSONDecodeError:
+            pass
 
-    # Merge explicit capture-time fields into sidecar_metadata (so detector has a single dict)
-    if sidecar_metadata is None:
-        sidecar_metadata = {}
+    is_captured = str(captured_in_app).lower() in ("true", "1", "yes")
+    if is_captured: sidecar_metadata["captured_in_app"] = True
+    if capture_session_id: sidecar_metadata["capture_session_id"] = capture_session_id
     
-    # Safely parse boolean
-    is_captured = False
-    if captured_in_app:
-        is_captured = str(captured_in_app).lower() in ("true", "1", "yes")
-    
-    if is_captured:
-        sidecar_metadata["captured_in_app"] = True
-    if capture_session_id:
-        sidecar_metadata["capture_session_id"] = capture_session_id
-    
-    # Safely parse timestamp
     if capture_timestamp_ms:
         try:
-            # Handle empty strings or decimals
-            ts_val = float(capture_timestamp_ms)
-            sidecar_metadata["capture_timestamp_ms"] = int(ts_val)
-        except (ValueError, TypeError):
-            logger.warning(f"[REQUEST] Invalid capture_timestamp: {capture_timestamp_ms}")
+            sidecar_metadata["capture_timestamp_ms"] = int(float(capture_timestamp_ms))
+        except:
+            pass
 
-    if capture_path:
-        sidecar_metadata["capture_path"] = capture_path
-    if capture_signature:
-        sidecar_metadata["capture_signature"] = capture_signature
+    if capture_path: sidecar_metadata["capture_path"] = capture_path
+    if capture_signature: sidecar_metadata["capture_signature"] = capture_signature
     
     file_content = await file.read()
     filesize = len(file_content)
     suffix = os.path.splitext(file.filename)[1].lower()
 
-    # [LOGGING] Request Input
-    log_meta_keys = list(sidecar_metadata.keys()) if sidecar_metadata else []
-    logger.info(f"[REQUEST] Processing: {file.filename} | Size: {filesize} bytes | Metadata: {log_meta_keys}")
+    logger.info(f"[REQUEST] Processing: {file.filename} | Size: {filesize} bytes")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
         tmp_file.write(file_content)
@@ -372,7 +235,6 @@ async def detect(
     try:
         start_time = time.time()
         
-        # The wrapper handles security logic; we pass detect_ai_media as the worker function
         result = await security_manager.secure_execute(
             request, file.filename, filesize, temp_path, 
             lambda path: detect_ai_media(path, trusted_metadata=sidecar_metadata, original_filename=file.filename)
@@ -380,7 +242,6 @@ async def detect(
         
         duration = time.time() - start_time
         gpu_used = result.get("layers", {}).get("layer2_forensics", {}).get("status") != "skipped"
-        
         actual_gpu_time_ms = result.get("gpu_time_ms", 0.0)
         actual_gpu_sec = actual_gpu_time_ms / 1000.0
         
@@ -388,7 +249,6 @@ async def detect(
             cost = actual_gpu_sec * GPU_RATE_PER_SEC
             method = "detect_with_gpu"
             gpu_sec, cpu_sec = actual_gpu_sec, duration - actual_gpu_sec
-            logger.info(f"[COST] GPU: {actual_gpu_sec:.3f}s (actual) | Cost: ${cost:.6f}")
         elif gpu_used:
             cost = duration * GPU_RATE_PER_SEC
             method = "detect_with_gpu"
@@ -399,8 +259,6 @@ async def detect(
             gpu_sec, cpu_sec = 0, duration
             
         log_usage(file.filename, filesize, method, cost, gpu_seconds=gpu_sec, cpu_seconds=cpu_sec)
-
-        # Keep gpu_time_ms in the API response (useful for clients + debugging/cost dashboards)
         return result
     finally:
         if os.path.exists(temp_path):
@@ -433,24 +291,17 @@ async def remove_watermark(request: Request, file: UploadFile = File(...)):
         )
         
         duration = time.time() - start_time
+        cost = duration * (GPU_RATE_PER_SEC if is_video else CPU_RATE_PER_SEC)
+        log_usage(file.filename, filesize, "remove-watermark", cost, gpu_seconds=duration if is_video else 0)
         
-        if is_video:
-            cost = duration * GPU_RATE_PER_SEC
-            log_usage(file.filename, filesize, "remove-watermark-video", cost, gpu_seconds=duration)
-            return {
-                "status": "success", "method": "runpod_gpu",
-                "cost_usd": round(cost, 5), "gpu_seconds": round(duration, 2), "result": result,
-            }
-        else:
-            cost = duration * CPU_RATE_PER_SEC
-            log_usage(file.filename, filesize, "remove-watermark-image", cost, cpu_seconds=duration)
-            return {
-                "status": "success", "method": "local_cheap",
-                "cost_usd": round(cost, 5), "filename": file.filename,
-            }
+        return {
+            "status": "success", 
+            "method": "runpod_gpu" if is_video else "local_cheap",
+            "cost_usd": round(cost, 5), 
+            "result": result,
+        }
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
+        if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(temp_path):

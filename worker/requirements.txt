@@ -2,4 +2,4 @@ runpod
 transformers==4.48.3
 accelerate
 safetensors
-Pillow
+Pillow-SIMD==9.5.0.post1

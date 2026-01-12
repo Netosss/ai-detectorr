@@ -6,101 +6,31 @@ import logging
 import io
 import time
 from PIL import Image
-import json
-import tempfile
-from pathlib import Path
 from typing import Dict, Any, Union
 
 logger = logging.getLogger(__name__)
 
-# Shared disk buffer for multi-process webhook handling (Railway fix)
-WEBHOOK_BUFFER_DIR = Path(tempfile.gettempdir()) / "runpod_webhook_buffer"
-WEBHOOK_BUFFER_DIR.mkdir(parents=True, exist_ok=True)
-
-def buffer_result_to_disk(job_id: str, result: dict):
-    """Save result to disk so other processes can see it."""
-    try:
-        file_path = WEBHOOK_BUFFER_DIR / f"{job_id}.json"
-        with open(file_path, 'w') as f:
-            json.dump({"result": result, "timestamp": time.time()}, f)
-        logger.info(f"[DISK-BUFFER] Job {job_id} saved to disk")
-    except Exception as e:
-        logger.error(f"[DISK-BUFFER] Failed to write {job_id}: {e}")
-
-def get_buffered_result_from_disk(job_id: str):
-    """Check disk for a result saved by another process."""
-    file_path = WEBHOOK_BUFFER_DIR / f"{job_id}.json"
-    if file_path.exists():
-        try:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            file_path.unlink() # Delete after reading
-            return data.get("result")
-        except Exception as e:
-            logger.error(f"[DISK-BUFFER] Failed to read {job_id}: {e}")
-    return None
-
-# ---- Pending Jobs for Webhook Support ----
-# Format: {job_id: (asyncio.Future, start_time)}
-# ⚠️ WARNING: This is in-memory and NOT safe for multi-instance deployments!
-# For multi-replica setups (K8s, Railway scale-out), use Redis/Upstash instead.
-pending_jobs: Dict[str, tuple] = {}
-
-# Buffer for webhook results that arrive before pending_jobs is set (race condition fix)
-# Format: {job_id: (result, timestamp)}
-webhook_result_buffer: Dict[str, tuple] = {}
-
-# TTL for pending jobs (seconds) - prevents memory leaks
-PENDING_JOB_TTL = 120  # 2 minutes
-WEBHOOK_BUFFER_TTL = 30  # 30 seconds for buffered results
-
-
-def cleanup_stale_jobs():
-    """Remove stale pending jobs and buffered results to prevent memory leaks."""
-    now = time.time()
-    
-    # Cleanup pending jobs
-    stale_jobs = [
-        job_id for job_id, (_, start_time) in pending_jobs.items()
-        if now - start_time > PENDING_JOB_TTL
-    ]
-    for job_id in stale_jobs:
-        future, _ = pending_jobs.pop(job_id, (None, None))
-        if future and not future.done():
-            future.set_exception(TimeoutError(f"Job {job_id} expired after {PENDING_JOB_TTL}s"))
-        logger.warning(f"[CLEANUP] Removed stale pending job: {job_id}")
-    
-    # Cleanup webhook buffer
-    stale_buffer = [
-        job_id for job_id, (_, timestamp) in webhook_result_buffer.items()
-        if now - timestamp > WEBHOOK_BUFFER_TTL
-    ]
-    for job_id in stale_buffer:
-        webhook_result_buffer.pop(job_id, None)
-        logger.warning(f"[CLEANUP] Removed stale buffered result: {job_id}")
-
-    # Cleanup disk buffer
-    try:
-        for p in WEBHOOK_BUFFER_DIR.glob("*.json"):
-            if now - p.stat().st_mtime > WEBHOOK_BUFFER_TTL:
-                p.unlink()
-                logger.warning(f"[CLEANUP] Removed stale disk result: {p.name}")
-    except Exception as e:
-        logger.error(f"[CLEANUP] Disk buffer cleanup error: {e}")
+# Module-level cache for RunPod endpoint object
+_ENDPOINT_CACHE = None
 
 def get_config():
     return {
         "api_key": os.getenv("RUNPOD_API_KEY"),
         "endpoint_id": os.getenv("RUNPOD_ENDPOINT_ID"),
-        "webhook_url": os.getenv("RUNPOD_WEBHOOK_URL"),  # e.g., https://your-api.com/webhook/runpod
     }
 
+def get_endpoint():
+    """Retrieve or initialize the RunPod endpoint (cached)."""
+    global _ENDPOINT_CACHE
+    config = get_config()
+    if not config["endpoint_id"]:
+        return None
+    if _ENDPOINT_CACHE is None:
+        runpod.api_key = config["api_key"]
+        _ENDPOINT_CACHE = runpod.Endpoint(config["endpoint_id"])
+    return _ENDPOINT_CACHE
+
 def optimize_image(source: Union[str, Image.Image], max_size: int = 1024) -> tuple:
-    """
-    Optimizes image for transfer. Accepts file path or PIL Image.
-    Returns: (base64_string, width, height)
-    Preserves enough detail for TruFor and Run 30 forensics.
-    """
     try:
         if isinstance(source, str):
             img = Image.open(source)
@@ -108,7 +38,6 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 1024) -> tup
             img = source
 
         orig_w, orig_h = img.size
-        # Resize if larger than max_size (1024 is the Run 30 sweet spot)
         if max(orig_w, orig_h) > max_size:
             img.thumbnail((max_size, max_size))
         
@@ -116,10 +45,8 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 1024) -> tup
             img = img.convert("RGB")
         
         buffer = io.BytesIO()
-        # High quality JPEG to preserve noise patterns for Model B interrogation
         img.save(buffer, format="JPEG", quality=95)
         
-        # Close handle if we opened it from path
         if isinstance(source, str):
             img.close()
 
@@ -129,362 +56,112 @@ def optimize_image(source: Union[str, Image.Image], max_size: int = 1024) -> tup
         logger.error(f"Optimization failed: {e}")
         return "", 0, 0
 
+async def poll_job(job, timeout=30):
+    """Tight async polling loop (200ms sweet spot)."""
+    start = time.monotonic()
+    # First poll very quickly
+    await asyncio.sleep(0.1)
+    
+    while True:
+        status_raw = job.status()
+        
+        # Robust status check (handles both string and dict responses)
+        if isinstance(status_raw, dict):
+            status = status_raw.get("status")
+        else:
+            status = status_raw
+        
+        if status == "COMPLETED":
+            # Robust output retrieval (handles embedded output in status)
+            if isinstance(status_raw, dict) and "output" in status_raw:
+                return status_raw["output"]
+            return job.output()
+
+        if status in ("FAILED", "CANCELLED"):
+            error_details = status_raw if isinstance(status_raw, dict) else status
+            raise RuntimeError(f"RunPod job {status}: {error_details}")
+
+        if time.monotonic() - start > timeout:
+            raise TimeoutError(f"Inference timed out after {timeout}s")
+
+        await asyncio.sleep(0.2)
+
 async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, height: int = 0) -> Dict[str, Any]:
-    """
-    Offloads forensic scan to RunPod. Supports webhooks (fast) or polling (fallback).
-    Returns: dict with raw model scores and metadata for consensus.
-    """
-    config = get_config()
-    if not config["endpoint_id"]:
-        return {"scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}, "gpu_time_ms": 0.0}
+    endpoint = get_endpoint()
+    if not endpoint:
+        return {"output": {}, "gpu_time_ms": 0.0, "error": "No endpoint ID configured"}
 
     try:
-        total_start = time.perf_counter()
-        
-        runpod.api_key = config["api_key"]
-        endpoint = runpod.Endpoint(config["endpoint_id"])
-        
-        # In-memory optimization (No Disk!)
-        t_opt = time.perf_counter()
         image_base64, w, h = optimize_image(source, max_size=1024)
-        opt_time_ms = (time.perf_counter() - t_opt) * 1000
-        payload_size_kb = len(image_base64) / 1024
-        logger.info(f"[TIMING] Image optimization: {opt_time_ms:.2f}ms | Payload: {payload_size_kb:.1f}KB")
         
-        # Priority: use passed dimensions, else use detected
-        final_w = width if width > 0 else w
-        final_h = height if height > 0 else h
-
         payload = {
             "image": image_base64,
-            "original_width": final_w,
-            "original_height": final_h,
-            "is_png": str(source).lower().endswith(".png") if isinstance(source, str) else False,
+            "original_width": width if width > 0 else w,
+            "original_height": height if height > 0 else h,
             "task": "deep_forensic"
         }
 
-        t_api = time.perf_counter()
-        webhook_url = config.get("webhook_url")
-        logger.info(f"[RUNPOD] Single Job | Task: deep_forensic | Webhook: {webhook_url}")
+        logger.info(f"[RUNPOD] Starting tight polling for job...")
+        job = endpoint.run(payload)
+        job_result = await poll_job(job)
         
-        if webhook_url:
-            job_result = await _run_with_webhook(endpoint, payload, webhook_url, timeout_seconds=90)
-            mode = "webhook"
-        else:
-            job_result = await _run_with_polling(endpoint, payload, timeout_seconds=90)
-            mode = "polling"
-        
-        api_time_ms = (time.perf_counter() - t_api) * 1000
-        total_time_ms = (time.perf_counter() - total_start) * 1000
-        
-        # Extract actual GPU time from worker response
-        gpu_time_ms = 0.0
-        logger.info(f"[DEBUG] Raw Worker Output: {job_result}")
-        if job_result and "timing_ms" in job_result:
-            worker_timing = job_result["timing_ms"]
-            if isinstance(worker_timing, dict):
-                gpu_time_ms = worker_timing.get("total", 0.0)
-            else:
-                gpu_time_ms = float(worker_timing)
-            logger.info(f"[TIMING] Worker breakdown: {worker_timing}")
-
-        logger.info(f"[TIMING] RunPod API call ({mode}): {api_time_ms:.2f}ms | Total: {total_time_ms:.2f}ms")
-
-        if job_result and "error" in job_result:
-            logger.warning(f"[RUNPOD] Job returned error: {job_result['error']}")
-        
-        # New Ensemble Worker Schema Support
-        output = job_result.get("results", {}) if job_result else {}
+        # Extract metadata from the new ensemble worker schema
+        output = job_result.get("results", {}) if isinstance(job_result, dict) else {}
         if not output and isinstance(job_result, dict):
-            # Fallback for old worker or single result structure
-            output = job_result
-        
-        # Check for errors nested inside the results
-        error = job_result.get("error") if job_result else None
-        if not error and isinstance(output, dict) and "error" in output:
-            error = output["error"]
-        
+            output = job_result # Fallback for flat structure
+            
+        timing = job_result.get("timing_ms", 0.0)
+        gpu_time_ms = timing.get("total", 0.0) if isinstance(timing, dict) else float(timing)
+
         return {
             "output": output,
             "gpu_time_ms": gpu_time_ms,
-            "error": error
+            "error": None
         }
     except Exception as e:
-        error_msg = f"RunPod call failed: {str(e)}"
-        logger.error(f"[RUNPOD] {error_msg}", exc_info=True)
-        return {"scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}, "gpu_time_ms": 0.0, "error": error_msg}
-
-
-def _batch_encode_images(frames: list) -> list:
-    """CPU-bound: Encode frames to base64 (runs in thread pool)."""
-    encoded = []
-    for frame in frames:
-        img = frame.copy()
-        # Resize for efficiency (512px max)
-        if max(img.size) > 512:
-            img.thumbnail((512, 512))
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
-        encoded.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
-    return encoded
-
+        error_msg = str(e)
+        logger.error(f"[RUNPOD] Polling failed: {error_msg}")
+        return {"output": {}, "gpu_time_ms": 0.0, "error": error_msg}
 
 async def run_batch_forensics(frames: list) -> Dict[str, Any]:
-    """
-    Batch process multiple frames in a SINGLE RunPod request.
-    Tri-Frame Strategy: GPU processes 3 images in ~same time as 1.
-    Returns: dict with 'results' list and 'gpu_time_ms'.
-    """
-    config = get_config()
-    if not config["endpoint_id"]:
-        return {"results": [], "gpu_time_ms": 0.0, "error": "No endpoint configured"}
-    
-    if not frames:
+    """Tight polling for video frames."""
+    endpoint = get_endpoint()
+    if not endpoint or not frames:
         return {"results": [], "gpu_time_ms": 0.0}
 
     try:
-        total_start = time.perf_counter()
-        
-        runpod.api_key = config["api_key"]
-        endpoint = runpod.Endpoint(config["endpoint_id"])
-        
-        # Offload CPU-bound encoding to thread pool (avoids blocking event loop)
-        t_opt = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        images_b64 = await loop.run_in_executor(None, _batch_encode_images, frames)
-        
-        opt_time_ms = (time.perf_counter() - t_opt) * 1000
-        total_payload_kb = sum(len(b) for b in images_b64) / 1024
-        logger.info(f"[TIMING] Batch encode ({len(frames)} frames): {opt_time_ms:.2f}ms | Total: {total_payload_kb:.1f}KB")
+        # Batch encode
+        images_b64 = []
+        for frame in frames:
+            img = frame.copy()
+            if max(img.size) > 512: img.thumbnail((512, 512))
+            if img.mode != "RGB": img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            images_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
-        payload = {
-            "images": images_b64,  # Batch list
-            "task": "deep_forensic"
-        }
+        job = endpoint.run({"images": images_b64, "task": "deep_forensic"})
+        job_result = await poll_job(job)
+        
+        results = job_result.get("results", []) if isinstance(job_result, dict) else []
+        timing = job_result.get("timing_ms", 0.0)
+        gpu_time_ms = timing.get("total", 0.0) if isinstance(timing, dict) else float(timing)
 
-        t_api = time.perf_counter()
-        webhook_url = config.get("webhook_url")
-        logger.info(f"[RUNPOD] Batch Job | Frames: {len(frames)} | Webhook: {webhook_url}")
-        
-        if webhook_url:
-            job_result = await _run_with_webhook(endpoint, payload, webhook_url, timeout_seconds=90)
-            mode = "webhook"
-        else:
-            job_result = await _run_with_polling(endpoint, payload, timeout_seconds=90)
-            mode = "polling"
-        
-        api_time_ms = (time.perf_counter() - t_api) * 1000
-        total_time_ms = (time.perf_counter() - total_start) * 1000
-        
-        # Extract results
-        gpu_time_ms = 0.0
-        results = []
-        
-        if job_result:
-            if "results" in job_result:
-                # Batch response
-                results = job_result["results"]
-            elif "ai_score" in job_result:
-                # Single result (fallback)
-                results = [job_result]
-            
-            if "timing_ms" in job_result:
-                worker_timing = job_result["timing_ms"]
-                if isinstance(worker_timing, dict):
-                    gpu_time_ms = worker_timing.get("total", 0.0)
-                else:
-                    gpu_time_ms = float(worker_timing)
-                logger.info(f"[TIMING] Batch worker: {worker_timing}")
-        
-        logger.info(f"[TIMING] Batch RunPod ({mode}): {api_time_ms:.2f}ms | Total: {total_time_ms:.2f}ms")
-        
-        return {
-            "results": results,
-            "gpu_time_ms": gpu_time_ms,
-            "error": job_result.get("error") if job_result else None
-        }
-        
+        return {"results": results, "gpu_time_ms": gpu_time_ms, "error": None}
     except Exception as e:
-        error_msg = f"Batch RunPod call failed: {str(e)}"
-        logger.error(f"[RUNPOD] {error_msg}", exc_info=True)
-        return {"results": [], "gpu_time_ms": 0.0, "error": error_msg}
+        return {"results": [], "gpu_time_ms": 0.0, "error": str(e)}
 
-
-async def _run_with_webhook(endpoint, payload: dict, webhook_url: str, timeout_seconds: int = 90) -> Dict[str, Any]:
-    """
-    Submit job with webhook and wait for callback. Much faster than polling!
-    Includes buffer polling to handle race conditions.
-    
-    Uses raw HTTP request to include webhook in payload per RunPod docs:
-    https://docs.runpod.io/serverless/endpoints/send-requests#webhook-notifications
-    """
-    import aiohttp
-    
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    start_time = time.time()
-    
-    # Periodic cleanup to prevent memory leaks
-    cleanup_stale_jobs()
-    
-    # Build the full request payload with webhook at top level
-    request_payload = {
-        "input": payload,
-        "webhook": webhook_url
-    }
-    
-    config = get_config()
-    endpoint_id = config["endpoint_id"]
-    api_key = config["api_key"]
-    
-    # Use raw HTTP request to include webhook (SDK doesn't support it directly)
-    url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=request_payload, headers=headers) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"[WEBHOOK] RunPod API error: {response.status} - {error_text}")
-                return {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": f"API error: {response.status}"}
-            
-            result = await response.json()
-            job_id = result.get("id")
-    
-    if not job_id:
-        logger.error("[WEBHOOK] No job_id returned from RunPod")
-        return {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": "No job_id returned"}
-    
-    logger.info(f"[WEBHOOK] Submitted job {job_id}, waiting for callback...")
-    
-    # Store future so webhook handler can resolve it
-    pending_jobs[job_id] = (future, start_time)
-    
-    # Check if webhook already arrived (race condition fix)
-    # 1. Check local memory
-    if job_id in webhook_result_buffer:
-        result, _ = webhook_result_buffer.pop(job_id)
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.info(f"[WEBHOOK] Job {job_id} found in local memory (arrived early) in {elapsed_ms:.2f}ms")
-        return result
-    
-    # 2. Check disk (multi-process fix)
-    disk_result = get_buffered_result_from_disk(job_id)
-    if disk_result:
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.info(f"[WEBHOOK] Job {job_id} found on disk (arrived early at another worker) in {elapsed_ms:.2f}ms")
-        return disk_result
-    
-    try:
-        # Wait for webhook with periodic buffer checks (race condition fix)
-        result = await _wait_with_buffer_check(future, job_id, timeout_seconds)
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.info(f"[WEBHOOK] Job {job_id} completed via webhook in {elapsed_ms:.2f}ms")
-        return result
-    except asyncio.TimeoutError:
-        logger.error(f"[WEBHOOK] Job {job_id} timed out after {timeout_seconds}s, falling back to status check")
-        # Fallback: check job status via API
-        try:
-            status_url = f"https://api.runpod.ai/v2/{endpoint_id}/status/{job_id}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(status_url, headers=headers) as response:
-                    if response.status == 200:
-                        status_result = await response.json()
-                        if status_result.get("status") == "COMPLETED":
-                            return status_result.get("output", {})
-        except Exception as e:
-            logger.error(f"[WEBHOOK] Fallback status check failed: {e}")
-        return {"error": "Webhook timeout", "ai_score": 0.0, "gpu_time_ms": 0.0}
-    finally:
-        # Cleanup
-        pending_jobs.pop(job_id, None)
-        webhook_result_buffer.pop(job_id, None)
-
-
-async def _wait_with_buffer_check(future: asyncio.Future, job_id: str, timeout_seconds: int):
-    """
-    Wait for future with periodic buffer checks (Memory and Disk).
-    """
-    deadline = time.time() + timeout_seconds
-    
-    while time.time() < deadline:
-        # 1. Check if future is resolved (This process received it)
-        if future.done():
-            return future.result()
-        
-        # 2. Check local memory buffer
-        if job_id in webhook_result_buffer:
-            result, _ = webhook_result_buffer.pop(job_id)
-            logger.info(f"[WEBHOOK] Job {job_id} found in local memory")
-            return result
-        
-        # 3. Check disk buffer (Another process received it)
-        disk_result = get_buffered_result_from_disk(job_id)
-        if disk_result:
-            logger.info(f"[WEBHOOK] Job {job_id} found on disk (received by another worker)")
-            return disk_result
-        
-        # Wait a bit before next check
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=0.1)
-        except asyncio.TimeoutError:
-            continue  # Keep checking
-    
-    raise asyncio.TimeoutError(f"Job {job_id} timed out")
-
-
-async def _run_with_polling(endpoint, payload: dict, timeout_seconds: int = 90) -> Dict[str, Any]:
-    """
-    Fallback polling mode when webhooks are not configured.
-    """
-    t_api = time.perf_counter()
-    job = endpoint.run(payload)
-    job_id = job.job_id
-    
-    # Fast polling (100ms intervals)
-    poll_count = 0
-    while True:
-        status = job.status()
-        poll_count += 1
-        if status == "COMPLETED":
-            job_result = job.output()
-            logger.info(f"[POLLING] Completed after {poll_count} polls")
-            return job_result
-        if status == "FAILED":
-            error_msg = f"RunPod job {job_id} failed after {poll_count} polls"
-            logger.error(f"[POLLING] {error_msg}")
-            return {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": error_msg}
-        if (time.perf_counter() - t_api) > timeout_seconds:
-            error_msg = f"RunPod job {job_id} timed out after {timeout_seconds}s"
-            logger.error(f"[POLLING] {error_msg}")
-            return {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": error_msg}
-        await asyncio.sleep(0.1)  # 100ms polling
-
-# ... (rest of the file remains the same) ...
 async def run_image_removal(image_path: str) -> Dict[str, Any]:
-    config = get_config()
-    if not config["endpoint_id"]: return {"error": "Missing endpoint"}
-    runpod.api_key = config["api_key"]
-    endpoint = runpod.Endpoint(config["endpoint_id"])
-    image_base64, w, h = optimize_image(image_path)
-    return endpoint.run_sync({"image": image_base64, "task": "image_removal"}, timeout=60)
+    endpoint = get_endpoint()
+    if not endpoint: return {"error": "No endpoint"}
+    image_base64, _, _ = optimize_image(image_path)
+    job = endpoint.run({"image": image_base64, "task": "image_removal"})
+    return await poll_job(job)
 
 async def run_video_removal(video_path: str) -> Dict[str, Any]:
-    config = get_config()
-    if not config["endpoint_id"]: return {"error": "Missing endpoint"}
-    runpod.api_key = config["api_key"]
-    endpoint = runpod.Endpoint(config["endpoint_id"])
+    endpoint = get_endpoint()
+    if not endpoint: return {"error": "No endpoint"}
     with open(video_path, "rb") as f:
         video_base64 = base64.b64encode(f.read()).decode("utf-8")
     job = endpoint.run({"video": video_base64, "task": "video_removal"})
-    while True:
-        status = job.status()
-        if status == "COMPLETED": return job.output()
-        if status == "FAILED": return {"error": "Job failed"}
-        await asyncio.sleep(1)
+    return await poll_job(job)
