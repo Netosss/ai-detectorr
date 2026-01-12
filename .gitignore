@@ -26,7 +26,13 @@ tuning_results_*.json
 hf_200_false_positives_meta.json
 phase1_results.jsonl
 ensemble_configs.json
-reports/test_evaluation_data.json
+reports/
+
+# --- Local dev / verification scripts ---
+test_local_worker.py
+verify_build_local.py
+verify_worker.py
+scripts/
 
 # --- Environment / Editor ---
 .env.*
