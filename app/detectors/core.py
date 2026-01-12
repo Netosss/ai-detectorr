@@ -62,7 +62,7 @@ def get_exif_data(file_path: str) -> dict:
     """Extract EXIF metadata from the image."""
     try:
         with Image.open(file_path) as img:
-            exif = img._getexif() or {}
+            exif = img.getexif() or {}
             exif_data = {}
             for tag, value in exif.items():
                 decoded = TAGS.get(tag, tag)
