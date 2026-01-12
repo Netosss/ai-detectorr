@@ -262,9 +262,11 @@ def decode_and_meta(args):
     except Exception as e:
         return (idx, None, None, None, str(e))
 
-def handler(job):
-    job_input = job.get("input", {})
-    images_b64 = job_input.get("images", [job_input.get("image")]) if "image" in job_input or "images" in job_input else []
+    def handler(job):
+        job_input = job.get("input", {})
+        logger.info(f"📥 [HANDLER] Job received: id={job.get('id')} | Task={job_input.get('task')}")
+        
+        images_b64 = job_input.get("images", [job_input.get("image")]) if "image" in job_input or "images" in job_input else []
     if not images_b64 or images_b64[0] is None: return {"error": "No image data"}
 
     total_start = time.perf_counter()
@@ -286,6 +288,7 @@ def handler(job):
         for i, res in enumerate(batch_results):
             results[images_to_process[i][0]] = res
 
+    logger.info(f"📤 [HANDLER] Job finished. Returning {len(results)} results.")
     return {
         "results": results if isinstance(job_input.get("images"), list) else results[0],
         "timing_ms": round((time.perf_counter() - total_start) * 1000, 2)

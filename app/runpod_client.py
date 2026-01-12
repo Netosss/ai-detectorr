@@ -198,6 +198,9 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         # For backward compatibility, we'll try to extract what we can.
         
         output = job_result.get("results", {}) if job_result else {}
+        if not output and isinstance(job_result, dict):
+            # Fallback for old worker or single result structure
+            output = job_result
         
         return {
             "output": output,
