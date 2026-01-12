@@ -254,12 +254,17 @@ def decode_and_meta(args):
     try:
         img_bytes = base64.b64decode(b64_str)
         img_hash = hashlib.md5(img_bytes).hexdigest()
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        # Extract EXIF during decode phase (Offloads from main prediction loop)
-        exif = img._getexif() or {}
-        exif_data = {TAGS.get(tag, tag): val for tag, val in exif.items()}
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # 1. Extract EXIF BEFORE conversion (Safer)
+        exif = img.getexif()
+        exif_data = {TAGS.get(tag, tag): val for tag, val in exif.items()} if exif else {}
+        
+        # 2. Convert to RGB for models
+        img = img.convert("RGB")
         return (idx, img, exif_data, img_hash, None)
     except Exception as e:
+        logger.error(f"Error decoding image {idx}: {e}")
         return (idx, None, None, None, str(e))
 
     def handler(job):

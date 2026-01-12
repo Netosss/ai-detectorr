@@ -377,6 +377,21 @@ async def detect_ai_media_image_logic(file_path: Optional[str], l1_data: dict = 
         forensic_res = await run_deep_forensics(img_pil if frame else file_path, width, height)
         worker_output = forensic_res.get("output", {})
         gpu_time = forensic_res.get("gpu_time_ms", 0)
+        
+        # Check for error in worker output
+        if forensic_res.get("error"):
+            logger.error(f"[RUNPOD] Forensic error: {forensic_res['error']}")
+            return {
+                "summary": "Analysis Failed",
+                "confidence_score": 0.5,
+                "suspicious": True,
+                "gpu_bypassed": False,
+                "layers": {
+                    "layer1_metadata": {"status": "error", "description": f"Worker error: {forensic_res['error']}"},
+                    "layer2_forensics": {"status": "error"}
+                }
+            }
+            
         forensic_cache.put(img_hash, {"output": worker_output})
 
     # --- 3. ENSEMBLE VERDICT (Direct from Worker) ---

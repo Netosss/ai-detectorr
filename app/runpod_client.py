@@ -194,18 +194,20 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
             logger.warning(f"[RUNPOD] Job returned error: {job_result['error']}")
         
         # New Ensemble Worker Schema Support
-        # The worker returns a "results" key which is either a list or a single object.
-        # For backward compatibility, we'll try to extract what we can.
-        
         output = job_result.get("results", {}) if job_result else {}
         if not output and isinstance(job_result, dict):
             # Fallback for old worker or single result structure
             output = job_result
         
+        # Check for errors nested inside the results
+        error = job_result.get("error") if job_result else None
+        if not error and isinstance(output, dict) and "error" in output:
+            error = output["error"]
+        
         return {
             "output": output,
             "gpu_time_ms": gpu_time_ms,
-            "error": job_result.get("error") if job_result else None
+            "error": error
         }
     except Exception as e:
         error_msg = f"RunPod call failed: {str(e)}"
