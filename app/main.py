@@ -152,28 +152,28 @@ async def runpod_webhook(request: Request):
             future, start_time = pending_jobs[job_id]
             
             if status == "COMPLETED" and output:
+                # Accept anything that is a dictionary from the worker
                 if not isinstance(output, dict):
-                    output = {"ai_score": 0.0, "gpu_time_ms": 0.0, "error": "Invalid output format"}
+                    logger.warning(f"[WEBHOOK] Job {job_id} output is not a dict: {type(output)}")
                 
                 if not future.done():
                     future.set_result(output)
             elif status == "FAILED":
                 error_output = {
                     "error": "Job failed", 
-                    "details": payload.get("error"),
-                    "ai_score": 0.0,
-                    "gpu_time_ms": 0.0
+                    "details": payload.get("error")
                 }
                 if not future.done():
                     future.set_result(error_output)
             else:
                 return {"status": "acknowledged"}
         elif job_id and status == "COMPLETED" and output:
-            if isinstance(output, dict) and "ai_score" in output:
+            # Buffer for race conditions (webhook arrives before job is tracked)
+            if isinstance(output, dict):
                 webhook_result_buffer[job_id] = (output, time.time())
-                logger.info(f"[WEBHOOK] Job {job_id} buffered")
+                logger.info(f"[WEBHOOK] Job {job_id} buffered (Early arrival)")
             else:
-                logger.warning(f"[WEBHOOK] Job {job_id} has invalid output, not buffering")
+                logger.warning(f"[WEBHOOK] Job {job_id} has non-dict output, ignoring buffer: {type(output)}")
         
         return {"status": "ok"}
     except Exception as e:
