@@ -7,12 +7,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # --- CACHE & ENVIRONMENT SETTINGS ---
 ENV HF_HOME=/app/cache
-# We set PYTHONPATH to include common locations, but handler.py also does dynamic injection
-ENV PYTHONPATH="/app:/app/third_party/grip/TruFor/TruFor_train_test:${PYTHONPATH}"
+ENV PYTHONPATH="/app"
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (Minimal for these models)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
@@ -28,12 +27,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY worker/builder.py /app/builder.py
 RUN python /app/builder.py && rm /app/builder.py
 
-# --- CORE FILES ---
-# Copy the entire third_party folder to maintain complex submodule structures
-COPY third_party /app/third_party
-
-# Copy production config
-COPY configs/production_v1.json /app/configs/production_v1.json
+# --- CONFIG & HANDLER ---
+# Copy production config (the winning ensemble config)
+COPY configs/new_optimized_config.json /app/configs/production_v1.json
 
 # Finally copy the handler code
 COPY worker/handler.py /app/handler.py

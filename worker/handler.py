@@ -8,64 +8,71 @@ import hashlib
 import numpy as np
 import concurrent.futures
 import os
+<<<<<<< HEAD
 import sys
+=======
+import json
+>>>>>>> 55b8f71 (empty commit)
 from pathlib import Path
 from collections import OrderedDict
 from PIL import Image, ImageFilter
 from transformers import AutoImageProcessor, AutoModelForImageClassification
+from PIL.ExifTags import TAGS
 
 # ---------------- Optimization Flags (RTX 4090 Optimized) ----------------
 if torch.cuda.is_available():
-    torch.set_float32_matmul_precision('high')  # Enables TF32 on 4090
+    torch.set_float32_matmul_precision('high')
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True       # cuDNN will find fastest kernels for 4090 architecture
-    torch.backends.cudnn.deterministic = False  # Prioritize speed over bit-wise reproducibility
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
-# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Device ----------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Initializing production worker on device: {device}")
 
-# ---------------- Helper Functions ----------------
-def apply_noise(img, sigma):
-    img_np = np.array(img).astype(np.float32)
-    noise = np.random.normal(0, sigma, img_np.shape).astype(np.float32)
-    return Image.fromarray(np.clip(img_np + noise, 0, 255).astype(np.uint8))
-
+# ---------------- Pre-processing Helpers ----------------
 def apply_sharpen(img, percent):
     return img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=percent, threshold=0))
 
-def apply_upscale_sharpen(img, size=(224, 224), percent=110):
-    img = img.resize(size, Image.Resampling.LANCZOS)
-    return img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=percent, threshold=0))
+def apply_upscale(img, size):
+    w, h = img.size
+    if w >= h: new_w, new_h = size, int(h * (size / w))
+    else: new_h, new_w = size, int(w * (size / h))
+    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-# ---------------- Worker Cache ----------------
-class WorkerLRUCache:
-    def __init__(self, capacity: int = 500):
-        self.cache = OrderedDict()
-        self.capacity = capacity
-    def get(self, key):
-        if key not in self.cache: return None
-        self.cache.move_to_end(key)
-        return self.cache[key]
-    def put(self, key, value):
-        if key in self.cache: self.cache.move_to_end(key)
-        self.cache[key] = value
-        if len(self.cache) > self.capacity: self.cache.popitem(last=False)
+def logit(p):
+    p = max(min(p, 0.999999), 0.000001)
+    return np.log(p / (1.0 - p))
 
-worker_cache = WorkerLRUCache(capacity=500)
+def get_slice_name(pixels):
+    if pixels < 2000: return "thumbnail"
+    if 2000 <= pixels < 10000: return "low_res"
+    if 10000 <= pixels < 50000: return "10k-50k"
+    if 50000 <= pixels < 500000: return "50k-500k"
+    return ">500k"
 
-# ---------------- TruFor Wrapper ----------------
-class TruForWrapper:
-    def __init__(self, device):
-        self.device = device
-        self.model = None
-        self.load_model()
+# ---------------- Metadata Scoring ----------------
+def get_forensic_metadata_score(exif: dict) -> float:
+    score = 0.0
+    def to_float(val):
+        try: return float(val)
+        except: return None
+    make = str(exif.get("Make", "")).lower()
+    software = str(exif.get("Software", "")).lower()
+    if any(m in make for m in ["apple", "google", "samsung", "sony", "canon", "nikon"]): score += 0.35
+    if any(s in software for s in ["ios", "android", "lightroom"]): score += 0.25
+    exp = to_float(exif.get("ExposureTime"))
+    if exp is not None and 0 < exp < 30: score += 0.15
+    iso = to_float(exif.get("ISOSpeedRatings"))
+    if iso is not None and 50 <= iso <= 102400: score += 0.15
+    f_num = to_float(exif.get("FNumber"))
+    if f_num is not None and 0.95 <= f_num <= 32: score += 0.15
+    if "DateTimeOriginal" in exif: score += 0.08
+    return round(score, 2)
 
+<<<<<<< HEAD
     def load_model(self):
         t_start = time.perf_counter()
         
@@ -253,13 +260,66 @@ class RouterClassifier:
             if any(k in label.lower() for k in ['ai', 'fake', 'generated']):
                 return idx
         return 0
+=======
+# ---------------- Ensemble Classifier ----------------
+class EnsembleClassifier:
+    def __init__(self):
+        self.device = device
+        self.config = self._load_config()
+        self.models = {}
+        self.processors = {}
+        self.ai_indices = {
+            "haywoodsloan/ai-image-detector-dev-deploy": 0,
+            "Ateeqq/ai-vs-human-image-detector": 0,
+            "Organika/sdxl-detector": 0
+        }
+        self.best_preprocess = {
+            "haywoodsloan/ai-image-detector-dev-deploy": {"sharpen": 110, "upscale": None},
+            "Ateeqq/ai-vs-human-image-detector": {"sharpen": 110, "upscale": None},
+            "Organika/sdxl-detector": {"sharpen": 100, "upscale": 224}
+        }
+        self.load_models_parallel()
+
+    def _load_config(self):
+        paths = ["/app/configs/production_v1.json", "configs/new_optimized_config.json"]
+        for p in paths:
+            if os.path.exists(p):
+                with open(p, 'r') as f: return json.load(f)
+        raise FileNotFoundError("Production config missing!")
+
+    def _init_single_model(self, mid):
+        logger.info(f"  Loading {mid}...")
+        proc = AutoImageProcessor.from_pretrained(mid, use_fast=False)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        model = AutoModelForImageClassification.from_pretrained(mid, torch_dtype=dtype).to(self.device).eval()
+        if self.device == "cuda":
+            model = model.half().to(memory_format=torch.channels_last)
+        return mid, model, proc
+
+    def load_models_parallel(self):
+        t_start = time.perf_counter()
+        logger.info("🚀 Parallel Boot: Loading Winning Ensemble...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(self._init_single_model, mid) for mid in self.best_preprocess.keys()]
+            for future in concurrent.futures.as_completed(futures):
+                mid, model, proc = future.result()
+                self.models[mid] = model
+                self.processors[mid] = proc
+
+        logger.info(f"✨ Production Ready in {(time.perf_counter() - t_start)*1000:.2f}ms")
+>>>>>>> 55b8f71 (empty commit)
 
     @torch.no_grad()
-    def _predict_single(self, model, processor, images):
-        try:
-            # Use fast path for tensor conversion
-            inputs = processor(images=images, return_tensors="pt")
+    def _predict_model(self, mid, images):
+        model, processor, prep = self.models[mid], self.processors[mid], self.best_preprocess[mid]
+        processed_imgs = []
+        for img in images:
+            if prep["upscale"]: img = apply_upscale(img, prep["upscale"])
+            if prep["sharpen"] > 100: img = apply_sharpen(img, prep["sharpen"])
+            processed_imgs.append(img)
             
+<<<<<<< HEAD
             # Get the model's actual parameter dtype to avoid Half/Float mismatch
             model_dtype = next(model.parameters()).dtype
             
@@ -283,48 +343,36 @@ class RouterClassifier:
         except Exception as e:
             logger.error(f"Inference error in _predict_single: {e}", exc_info=True)
             return [0.5] * len(images)
-
-    def predict_batch(self, images: list, is_png_list: list = None):
-        """
-        Implements Run 30 Surgical Preprocessing and Model Inference.
-        Returns raw scores for A, B, and TruFor.
-        """
-        batch_size = len(images)
-        batch_a = []
-        batch_b = []
-        batch_t = []
+=======
+        inputs = processor(images=processed_imgs, return_tensors="pt").to(self.device)
+        model_dtype = next(model.parameters()).dtype
         
-        for idx, img in enumerate(images):
-            img = img.convert("RGB")
-            w, h = img.size
-            pixels = w * h
-            is_png = is_png_list[idx] if is_png_list else False
-            
-            # --- Model A Surgical ---
-            if is_png: img_a = apply_noise(img, 5)
-            elif pixels < 2000: img_a = apply_noise(img, 10)
-            elif 2000 <= pixels < 10000: img_a = apply_noise(img, 5)
-            elif 10000 <= pixels < 500000:
-                t_size = (224, 224) if pixels > 100000 else (448, 448)
-                img_a = apply_upscale_sharpen(img, size=t_size, percent=110)
-            else: img_a = apply_sharpen(img, 110)
-            batch_a.append(img_a)
-            
-            # --- Model B Surgical ---
-            if pixels < 2000: img_b = apply_noise(img, 5)
-            elif 2000 <= pixels < 10000: img_b = apply_noise(img, 3)
-            else: img_b = img # RAW for >10k
-            batch_b.append(img_b)
-            
-            # --- TruFor Surgical ---
-            img_t = img
-            if pixels >= 200000: img_t = apply_sharpen(img, 110)
-            batch_t.append(img_t)
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                v = v.to(self.device, non_blocking=True)
+                if v.ndim == 4: v = v.to(memory_format=torch.channels_last)
+                if v.is_floating_point(): v = v.to(model_dtype)
+                inputs[k] = v
+                
+        outputs = model(**inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        return probs[:, self.ai_indices[mid]].cpu().numpy()
+>>>>>>> 55b8f71 (empty commit)
 
-        # Launch all 3 models in parallel with timing
-        logger.info(f"Starting inference batch (size={batch_size})...")
-        t_inf_start = time.perf_counter()
+    def predict_batch(self, images_data: list):
+        # images_data contains (PIL_Image, EXIF_Dict)
+        batch_size = len(images_data)
+        pil_images = [x[0] for x in images_data]
         
+        # CPU parallel execution for model predictions
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(self._predict_model, mid, pil_images): mid for mid in self.models.keys()}
+            results_by_model = {futures[f]: f.result() for f in concurrent.futures.as_completed(futures)}
+            
+        final_batch_results = []
+        window = self.config['suspicion']['window']
+        
+<<<<<<< HEAD
         f_a = self.executor.submit(self._predict_single, self.model_a, self.processor_a, batch_a)
         f_b = self.executor.submit(self._predict_single, self.model_b, self.processor_b, batch_b)
         
@@ -354,103 +402,91 @@ class RouterClassifier:
         logger.info(f"Inference batch completed in {inf_duration:.2f}ms")
         
         final_results = []
+=======
+>>>>>>> 55b8f71 (empty commit)
         for i in range(batch_size):
-            final_results.append({
-                "A": float(res_a[i]),
-                "B": float(res_b[i]),
-                "TruFor": float(res_t[i])
+            img, exif = images_data[i]
+            px = img.size[0] * img.size[1]
+            slice_name = get_slice_name(px)
+            slice_cfg = self.config['slices'].get(slice_name, self.config['slices']['>500k'])
+            
+            m_h = get_forensic_metadata_score(exif)
+            
+            l_total = 0
+            model_probs = {}
+            for mid in self.models.keys():
+                p = float(results_by_model[mid][i])
+                model_probs[mid.split('/')[-1]] = p
+                l_total += slice_cfg['weights'].get(mid, 0.0) * logit(p)
+            
+            margin = slice_cfg['margin']
+            is_ai = l_total > margin
+            
+            # Magic Tool Logic
+            magic_triggered = False
+            if (px > 500000 and abs(l_total - margin) < window) or \
+               (max(model_probs.values()) - min(model_probs.values()) > 0.8) or \
+               (m_h > 0.7 and l_total > (margin + 1.5)):
+                magic_triggered, is_ai = True, True
+            
+            final_batch_results.append({
+                "ai_score": float(torch.sigmoid(torch.tensor(l_total)).item()),
+                "is_ai": bool(is_ai),
+                "magic_triggered": magic_triggered,
+                "slice": slice_name,
+                "breakdown": model_probs,
+                "metadata_h": m_h
             })
-        return final_results
+        return final_batch_results
 
+<<<<<<< HEAD
 classifier = RouterClassifier()
+=======
+classifier = EnsembleClassifier()
+>>>>>>> 55b8f71 (empty commit)
 decode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
-def decode_image(args):
+def decode_and_meta(args):
     idx, b64_str = args
     try:
         img_bytes = base64.b64decode(b64_str)
         img_hash = hashlib.md5(img_bytes).hexdigest()
-        return (idx, img_bytes, img_hash, None)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        # Extract EXIF during decode phase (Offloads from main prediction loop)
+        exif = img._getexif() or {}
+        exif_data = {TAGS.get(tag, tag): val for tag, val in exif.items()}
+        return (idx, img, exif_data, img_hash, None)
     except Exception as e:
-        return (idx, None, None, str(e))
+        return (idx, None, None, None, str(e))
 
 def handler(job):
     job_input = job.get("input", {})
-    images_b64 = []
-    is_batch = False
-    
-    if "images" in job_input and isinstance(job_input["images"], list):
-        images_b64 = job_input["images"]
-        is_batch = True
-    elif "image" in job_input:
-        images_b64 = [job_input["image"]]
-    else:
-        return {"error": "No image data provided"}
+    images_b64 = job_input.get("images", [job_input.get("image")]) if "image" in job_input or "images" in job_input else []
+    if not images_b64 or images_b64[0] is None: return {"error": "No image data"}
 
     total_start = time.perf_counter()
     results = [None] * len(images_b64)
+    images_to_process = [] # Will hold (idx, PIL_Image, Exif_Dict, Hash)
     
-    images_to_process = []
-    hashes_to_process = []
-    
-    t0 = time.perf_counter()
+    # 1. Parallel Decode & Metadata Extraction
     decode_args = [(i, s) for i, s in enumerate(images_b64)]
-    futures = decode_pool.map(decode_image, decode_args)
-    
-    for idx, img_bytes, img_hash, err in futures:
+    for idx, img, exif, img_hash, err in decode_pool.map(decode_and_meta, decode_args):
         if err:
-            results[idx] = {"error": err, "scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}}
+            results[idx] = {"error": err}
             continue
-            
-        cached = worker_cache.get(img_hash)
-        if cached:
-            res = cached.copy()
-            res["cache_hit"] = True
-            results[idx] = res
-            continue
-            
-        try:
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            images_to_process.append((idx, img))
-            hashes_to_process.append(img_hash)
-        except Exception as e:
-             results[idx] = {"error": str(e), "scores": {"A": 0.5, "B": 0.5, "TruFor": 0.5}}
+        images_to_process.append((idx, img, exif, img_hash))
 
-    decode_ms = (time.perf_counter() - t0) * 1000
-    
+    # 2. Batch GPU Inference
     if images_to_process:
-        pil_images = [x[1] for x in images_to_process]
-        is_png_list = [job_input.get("is_png", False)] * len(pil_images)
-        t1 = time.perf_counter()
-        
-        raw_scores = classifier.predict_batch(pil_images, is_png_list=is_png_list)
-        
-        gpu_ms = (time.perf_counter() - t1) * 1000
-        
-        for i, scores in enumerate(raw_scores):
-            original_idx = images_to_process[i][0]
-            res = {"scores": scores, "cache_hit": False}
-            # The app layer expects 'ai_score' for backwards compatibility if needed, 
-            # but we'll primarily use the breakdown.
-            # Calculating a simple average as fallback ai_score
-            res["ai_score"] = (scores["A"] + scores["B"] + scores["TruFor"]) / 3
-            worker_cache.put(hashes_to_process[i], res)
-            results[original_idx] = res
-                
-    total_ms = (time.perf_counter() - total_start) * 1000
-    
-    response = {
-        "results": results if is_batch else results[0],
-        "timing_ms": {
-            "decode": round(decode_ms, 2),
-            "total": round(total_ms, 2)
-        }
+        batch_input = [(x[1], x[2]) for x in images_to_process]
+        batch_results = classifier.predict_batch(batch_input)
+        for i, res in enumerate(batch_results):
+            results[images_to_process[i][0]] = res
+
+    return {
+        "results": results if isinstance(job_input.get("images"), list) else results[0],
+        "timing_ms": round((time.perf_counter() - total_start) * 1000, 2)
     }
-    
-    if not is_batch:
-        return {**results[0], "timing_ms": response["timing_ms"]}
-        
-    return response
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})

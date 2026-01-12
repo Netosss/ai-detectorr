@@ -13,6 +13,8 @@ dist/
 # --- Local datasets / benchmarks (do not commit) ---
 tests/data/
 tests/data/**
+data/
+data/**
 
 # --- Local logs / reports ---
 server.log
@@ -22,6 +24,9 @@ tuning_log.txt
 tuning_comprehensive_log.txt
 tuning_results_*.json
 hf_200_false_positives_meta.json
+phase1_results.jsonl
+ensemble_configs.json
+reports/test_evaluation_data.json
 
 # --- Environment / Editor ---
 .env.*
@@ -30,9 +35,11 @@ hf_200_false_positives_meta.json
 .idea/
 .cursor/
 
-# --- Configs (protect sensitive params) ---
+# --- Configs ---
+# Track production configs but ignore local variations
 configs/*.json
-!configs/production_v1.json  # Exception if user wants this tracked
+!configs/production_v1.json
+!configs/new_optimized_config.json
 
 # --- Large Binaries / Weights ---
 third_party/**/pretrained_models/**

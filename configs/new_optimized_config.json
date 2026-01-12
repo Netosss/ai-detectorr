@@ -1,0 +1,45 @@
+{
+    "dual_gate_metadata": {
+        "human_threshold": 0.3120382111252304,
+        "ai_threshold": 0.15986166933141838
+    },
+    "slices": {
+        ">500k": {
+            "weights": {
+                "Ateeqq/ai-vs-human-image-detector": 0.19194897710477543,
+                "haywoodsloan/ai-image-detector-dev-deploy": 0.7948609397248468,
+                "Organika/sdxl-detector": 0.013190083170377708
+            },
+            "alpha": 0.6513066084454937,
+            "tau": 0.04506596924577912,
+            "margin": 1.9793650649610959,
+            "best_ba": 0.771095733810839
+        },
+        "50k-500k": {
+            "weights": {
+                "Ateeqq/ai-vs-human-image-detector": 0.4233553869399195,
+                "haywoodsloan/ai-image-detector-dev-deploy": 0.33374261774470765,
+                "Organika/sdxl-detector": 0.24290199531537285
+            },
+            "alpha": 0.5681986462413591,
+            "tau": 0.9911068156012064,
+            "margin": -1.723600148068443,
+            "best_ba": 0.7990342385808149
+        },
+        "10k-50k": {
+            "weights": {
+                "Ateeqq/ai-vs-human-image-detector": 0.21048493741745158,
+                "haywoodsloan/ai-image-detector-dev-deploy": 0.5605909349156896,
+                "Organika/sdxl-detector": 0.22892412766685877
+            },
+            "alpha": 0.34880374380837975,
+            "tau": 0.47170338567415704,
+            "margin": 1.3357586043991883,
+            "best_ba": 1.0
+        }
+    },
+    "suspicion": {
+        "window": 0.1123857305657932,
+        "center": "margin"
+    }
+}

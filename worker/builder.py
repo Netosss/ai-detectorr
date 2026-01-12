@@ -14,8 +14,9 @@ def download_models():
     By baking these into the Docker image, we avoid cold-start delays.
     """
     models = [
-        "haywoodsloan/ai-image-detector-dev-deploy", # Model A
-        "Ateeqq/ai-vs-human-image-detector"           # Model B
+        "haywoodsloan/ai-image-detector-dev-deploy",
+        "Ateeqq/ai-vs-human-image-detector",
+        "Organika/sdxl-detector"
     ]
     
     logger.info("Starting build-time model download...")
