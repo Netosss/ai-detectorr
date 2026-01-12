@@ -267,12 +267,13 @@ def decode_and_meta(args):
         logger.error(f"Error decoding image {idx}: {e}")
         return (idx, None, None, None, str(e))
 
-    def handler(job):
-        job_input = job.get("input", {})
-        logger.info(f"📥 [HANDLER] Job received: id={job.get('id')} | Task={job_input.get('task')}")
-        
-        images_b64 = job_input.get("images", [job_input.get("image")]) if "image" in job_input or "images" in job_input else []
-    if not images_b64 or images_b64[0] is None: return {"error": "No image data"}
+def handler(job):
+    job_input = job.get("input", {})
+    logger.info(f"📥 [HANDLER] Job received: id={job.get('id')} | Task={job_input.get('task')}")
+    
+    images_b64 = job_input.get("images", [job_input.get("image")]) if "image" in job_input or "images" in job_input else []
+    if not images_b64 or images_b64[0] is None: 
+        return {"error": "No image data"}
 
     total_start = time.perf_counter()
     results = [None] * len(images_b64)
@@ -300,4 +301,5 @@ def decode_and_meta(args):
     }
 
 if __name__ == "__main__":
+    assert callable(handler), "handler must be a top-level callable"
     runpod.serverless.start({"handler": handler})
