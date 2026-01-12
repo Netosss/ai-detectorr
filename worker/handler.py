@@ -155,6 +155,7 @@ class EnsembleClassifier:
     @torch.no_grad()
     def _predict_model(self, mid, images):
         model, processor, prep = self.models[mid], self.processors[mid], self.best_preprocess[mid]
+        logger.info(f"  [MODEL-RUN] Starting {mid} (Prep: {prep})")
         processed_imgs = []
         for img in images:
             if prep["upscale"]: img = apply_upscale(img, prep["upscale"])
@@ -173,12 +174,15 @@ class EnsembleClassifier:
                 
         outputs = model(**inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        return probs[:, self.ai_indices[mid]].cpu().tolist()
+        ai_probs = probs[:, self.ai_indices[mid]].cpu().tolist()
+        logger.info(f"  [MODEL-RUN] Finished {mid}. First AI Prob: {ai_probs[0]:.4f}")
+        return ai_probs
 
     def predict_batch(self, images_data: list):
         # images_data contains (PIL_Image, EXIF_Dict)
         batch_size = len(images_data)
         pil_images = [x[0] for x in images_data]
+        logger.info(f"🚀 [ENSEMBLE] Processing batch of {batch_size} images")
         
         # parallel execution for model predictions
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
@@ -195,21 +199,27 @@ class EnsembleClassifier:
             slice_cfg = self.config['slices'].get(slice_name, self.config['slices']['>500k'])
             
             m_h = get_forensic_metadata_score(exif)
+            m_ai, _ = get_ai_suspicion_score(exif, img.size[0], img.size[1], 0) # file_size unknown
+            
+            logger.info(f"  [IMAGE-{i}] Slice: {slice_name} | Metadata H: {m_h} | Metadata AI: {m_ai}")
             
             l_total = 0
             model_probs = {}
             for mid in self.models.keys():
                 p = float(results_by_model[mid][i])
-                model_probs[mid.split('/')[-1]] = p
-                l_total += slice_cfg['weights'].get(mid, 0.0) * logit(p)
+                m_short = mid.split('/')[-1]
+                model_probs[m_short] = p
+                w = slice_cfg['weights'].get(mid, 0.0)
+                l_total += w * logit(p)
+                logger.info(f"    - {m_short}: prob={p:.4f}, weight={w:.3f}")
             
             # --- Metadata Gating (Run 30 logic) ---
-            m_ai, _ = get_ai_suspicion_score(exif, img.size[0], img.size[1], 0) # file_size unknown
             l_final = l_total
             if abs(l_total) < slice_cfg.get('tau', 0.0):
                 alpha = slice_cfg.get('alpha', 1.0)
                 meta_signal = m_ai - m_h
                 l_final = (alpha * l_total) + ((1 - alpha) * meta_signal)
+                logger.info(f"    [GATING] Applied! l_total={l_total:.3f} -> l_final={l_final:.3f} (meta_signal={meta_signal:.2f})")
 
             margin = slice_cfg['margin']
             is_ai = l_final > margin
@@ -221,6 +231,8 @@ class EnsembleClassifier:
             # magic_triggered = should_use_magic_tool(px, l_final, margin, window, model_probs, m_h)
             # if magic_triggered: is_ai = True
             magic_triggered = False 
+            
+            logger.info(f"  [RESULT-{i}] l_final={l_final:.3f}, margin={margin:.3f}, is_ai={is_ai}, suspicious={is_suspicious}")
             
             final_batch_results.append({
                 "ai_score": float(torch.sigmoid(torch.tensor(l_final)).item()),

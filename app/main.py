@@ -146,7 +146,11 @@ async def runpod_webhook(request: Request):
         status = payload.get("status")
         output = payload.get("output")
         
-        logger.info(f"[WEBHOOK] Received callback for job {job_id}, status: {status}")
+        logger.info(f"[WEBHOOK] Callback received: job={job_id}, status={status}")
+        if output:
+            # Mask base64 or long data if present, but show keys
+            out_keys = list(output.keys()) if isinstance(output, dict) else "non-dict"
+            logger.info(f"[WEBHOOK] Output keys: {out_keys}")
         
         if job_id and job_id in pending_jobs:
             future, start_time = pending_jobs[job_id]

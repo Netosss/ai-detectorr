@@ -165,6 +165,7 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
 
         t_api = time.perf_counter()
         webhook_url = config.get("webhook_url")
+        logger.info(f"[RUNPOD] Single Job | Task: deep_forensic | Webhook: {webhook_url}")
         
         if webhook_url:
             job_result = await _run_with_webhook(endpoint, payload, webhook_url, timeout_seconds=90)
@@ -178,6 +179,7 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         
         # Extract actual GPU time from worker response
         gpu_time_ms = 0.0
+        logger.info(f"[DEBUG] Raw Worker Output: {job_result}")
         if job_result and "timing_ms" in job_result:
             worker_timing = job_result["timing_ms"]
             if isinstance(worker_timing, dict):
@@ -260,6 +262,7 @@ async def run_batch_forensics(frames: list) -> Dict[str, Any]:
 
         t_api = time.perf_counter()
         webhook_url = config.get("webhook_url")
+        logger.info(f"[RUNPOD] Batch Job | Frames: {len(frames)} | Webhook: {webhook_url}")
         
         if webhook_url:
             job_result = await _run_with_webhook(endpoint, payload, webhook_url, timeout_seconds=90)
