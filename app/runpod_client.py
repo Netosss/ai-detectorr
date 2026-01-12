@@ -141,7 +141,10 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         gpu_time_ms = 0.0
         if job_result and "timing_ms" in job_result:
             worker_timing = job_result["timing_ms"]
-            gpu_time_ms = worker_timing.get("total", 0.0)
+            if isinstance(worker_timing, dict):
+                gpu_time_ms = worker_timing.get("total", 0.0)
+            else:
+                gpu_time_ms = float(worker_timing)
             logger.info(f"[TIMING] Worker breakdown: {worker_timing}")
 
         logger.info(f"[TIMING] RunPod API call ({mode}): {api_time_ms:.2f}ms | Total: {total_time_ms:.2f}ms")
@@ -149,11 +152,14 @@ async def run_deep_forensics(source: Union[str, Image.Image], width: int = 0, he
         if job_result and "error" in job_result:
             logger.warning(f"[RUNPOD] Job returned error: {job_result['error']}")
         
-        # New Run 30 Return Schema
-        scores = job_result.get("scores", {"A": 0.5, "B": 0.5, "TruFor": 0.5})
+        # New Ensemble Worker Schema Support
+        # The worker returns a "results" key which is either a list or a single object.
+        # For backward compatibility, we'll try to extract what we can.
+        
+        output = job_result.get("results", {}) if job_result else {}
         
         return {
-            "scores": scores,
+            "output": output,
             "gpu_time_ms": gpu_time_ms,
             "error": job_result.get("error") if job_result else None
         }
@@ -239,8 +245,12 @@ async def run_batch_forensics(frames: list) -> Dict[str, Any]:
                 results = [job_result]
             
             if "timing_ms" in job_result:
-                gpu_time_ms = job_result["timing_ms"].get("total", 0.0)
-                logger.info(f"[TIMING] Batch worker: {job_result['timing_ms']}")
+                worker_timing = job_result["timing_ms"]
+                if isinstance(worker_timing, dict):
+                    gpu_time_ms = worker_timing.get("total", 0.0)
+                else:
+                    gpu_time_ms = float(worker_timing)
+                logger.info(f"[TIMING] Batch worker: {worker_timing}")
         
         logger.info(f"[TIMING] Batch RunPod ({mode}): {api_time_ms:.2f}ms | Total: {total_time_ms:.2f}ms")
         

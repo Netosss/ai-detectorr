@@ -371,57 +371,67 @@ async def detect_ai_media_image_logic(file_path: Optional[str], l1_data: dict = 
     cached = forensic_cache.get(img_hash)
     if cached:
         logger.info(f"[CACHE] Hit for {original_filename or file_path}")
-        scores = cached["scores"]
+        worker_output = cached["output"]
         gpu_time = 0
     else:
         forensic_res = await run_deep_forensics(img_pil if frame else file_path, width, height)
-        scores = forensic_res.get("scores", {"A": 0.5, "B": 0.5, "TruFor": 0.5})
+        worker_output = forensic_res.get("output", {})
         gpu_time = forensic_res.get("gpu_time_ms", 0)
-        forensic_cache.put(img_hash, {"scores": scores})
+        forensic_cache.put(img_hash, {"output": worker_output})
 
-    # --- 3. RUN 30 ENSEMBLE CONSENSUS ---
-    ext = Path(file_path).suffix.lower() if file_path else ".jpg"
-    pixels = width * height
-    aspect = width / height if height != 0 else 1.0
-    slice_name = get_slice_name(pixels, width, height, ext, aspect)
-    p = PROD_CONFIG['slices'].get(slice_name, PROD_CONFIG['slices']['default'])
+    # --- 3. ENSEMBLE VERDICT (Direct from Worker) ---
+    # The worker already performed the ensemble logic using the optimized config.
+    # We trust its decision but map it back to our local schema.
+    
+    if worker_output and "ai_score" in worker_output:
+        final_p = worker_output["ai_score"]
+        verdict_is_ai = worker_output["is_ai"]
+        is_suspicious = worker_output.get("magic_triggered", False) or worker_output.get("suspicious", False)
+        slice_name = worker_output.get("slice", "unknown")
+        model_probs = worker_output.get("breakdown", {})
+        
+        # If the worker didn't provide 'suspicious' but we have its decision logic, 
+        # we can still check the window if needed, but the worker already did it.
+        if "suspicious" not in worker_output and not is_suspicious:
+             # Fallback suspicion check if not provided by worker
+             is_suspicious = worker_output.get("magic_triggered", False)
+        
+        summary = "Likely AI" if verdict_is_ai else "Likely Human"
+        if is_suspicious: 
+            summary = "Suspicious (Uncertain)"
+            if worker_output.get("magic_triggered"):
+                summary = "Suspicious (Override)"
 
-    l_a, l_b, l_t = logit(scores['A']), logit(scores['B']), logit(scores['TruFor'])
-    l_total = (p['wA'] * l_a) + (p['wB'] * l_b) + (p['wT'] * l_t)
-    
-    l_final = l_total
-    # Metadata Gating (Tau)
-    if abs(l_total) < p['tau']:
-        meta_signal = m_ai - m_h
-        l_final = (p['alpha'] * l_total) + ((1 - p['alpha']) * meta_signal)
+        return {
+            "summary": summary,
+            "confidence_score": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
+            "suspicious": is_suspicious,
+            "gpu_bypassed": False,
+            "layers": {
+                "layer1_metadata": {
+                    "status": "not_found",
+                    "human_score": m_h, 
+                    "ai_score": m_ai, 
+                    "signals": ai_signals + h_signals
+                },
+                "layer2_forensics": {
+                    "status": "detected" if verdict_is_ai else "not_detected",
+                    "probability": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
+                    "signals": [f"Slice: {slice_name}"] + [f"{m}: {p:.2f}" for m, p in model_probs.items()]
+                }
+            },
+            "gpu_time_ms": gpu_time
+        }
 
-    # --- 4. FINAL VERDICT ---
-    verdict_is_ai = l_final > p['margin']
-    final_p = 1 / (1 + math.exp(-l_final))
-    
-    # Suspicion Window
-    is_suspicious = abs(l_final - p['margin']) < PROD_CONFIG['suspicion']['window']
-    
-    summary = "Likely AI" if verdict_is_ai else "Likely Human"
-    if is_suspicious: summary = "Suspicious (Uncertain)"
-    
+    # --- 4. FALLBACK (If worker failed or returned old schema) ---
+    # This shouldn't happen with the new ensemble worker.
     return {
-        "summary": summary,
-        "confidence_score": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
-        "suspicious": is_suspicious,
+        "summary": "Analysis Failed",
+        "confidence_score": 0.5,
+        "suspicious": True,
         "gpu_bypassed": False,
         "layers": {
-            "layer1_metadata": {
-                "status": "not_found",
-                "human_score": m_h, 
-                "ai_score": m_ai, 
-                "signals": ai_signals + h_signals
-            },
-            "layer2_forensics": {
-                "status": "detected" if verdict_is_ai else "not_detected",
-                "probability": round(final_p if verdict_is_ai else 1.0 - final_p, 2),
-                "signals": [f"Slice: {slice_name}"]
-            }
-        },
-        "gpu_time_ms": gpu_time
+            "layer1_metadata": {"status": "error", "description": "Worker response mismatch."},
+            "layer2_forensics": {"status": "error"}
+        }
     }

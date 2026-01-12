@@ -47,6 +47,25 @@ def get_slice_name(pixels):
     if 50000 <= pixels < 500000: return "50k-500k"
     return ">500k"
 
+def should_use_magic_tool(px, l_total, margin, window, model_probs, m_h):
+    """
+    Decides whether to trigger the 'Magic Tool' override.
+    Currently separated as per user request to be toggled manually.
+    """
+    # Rule 1: High-Res Uncertainty (near the margin)
+    if px > 500000 and abs(l_total - margin) < window:
+        return True
+    
+    # Rule 2: Inter-model Conflict (massive disagreement between models)
+    if (max(model_probs.values()) - min(model_probs.values())) > 0.8:
+        return True
+        
+    # Rule 3: Metadata Paradox (high human signals but high ensemble AI logit)
+    if m_h > 0.7 and l_total > (margin + 1.5):
+        return True
+        
+    return False
+
 # ---------------- Metadata Scoring ----------------
 def get_forensic_metadata_score(exif: dict) -> float:
     score = 0.0
@@ -65,6 +84,25 @@ def get_forensic_metadata_score(exif: dict) -> float:
     if f_num is not None and 0.95 <= f_num <= 32: score += 0.15
     if "DateTimeOriginal" in exif: score += 0.08
     return round(score, 2)
+
+def get_ai_suspicion_score(exif: dict, width: int = 0, height: int = 0, file_size: int = 0) -> tuple:
+    score = 0.0
+    signals = []
+    has_camera_info = exif.get("Make") or exif.get("Model")
+    ai_keywords = ["stable", "diffusion", "midjourney", "dalle", "flux", "sora", "generative"]
+    software = str(exif.get("Software", "")).lower()
+    make = str(exif.get("Make", "")).lower()
+    if any(k in software for k in ai_keywords) or any(k in make for k in ai_keywords):
+        score += 0.40
+        signals.append("AI software signature")
+    if not has_camera_info:
+        score += 0.10
+        signals.append("Missing hardware provenance")
+    if width > 0 and height > 0 and not has_camera_info:
+        if width in [512, 768, 1024, 1536, 2048] or height in [512, 768, 1024, 1536, 2048]:
+            score += 0.15
+            signals.append("AI-typical dimensions")
+    return round(min(score, 1.0), 2), signals
 
 # ---------------- Ensemble Classifier ----------------
 class EnsembleClassifier:
@@ -165,23 +203,34 @@ class EnsembleClassifier:
                 model_probs[mid.split('/')[-1]] = p
                 l_total += slice_cfg['weights'].get(mid, 0.0) * logit(p)
             
+            # --- Metadata Gating (Run 30 logic) ---
+            m_ai, _ = get_ai_suspicion_score(exif, img.size[0], img.size[1], 0) # file_size unknown
+            l_final = l_total
+            if abs(l_total) < slice_cfg.get('tau', 0.0):
+                alpha = slice_cfg.get('alpha', 1.0)
+                meta_signal = m_ai - m_h
+                l_final = (alpha * l_total) + ((1 - alpha) * meta_signal)
+
             margin = slice_cfg['margin']
-            is_ai = l_total > margin
+            is_ai = l_final > margin
             
-            # Magic Tool Logic
-            magic_triggered = False
-            if (px > 500000 and abs(l_total - margin) < window) or \
-               (max(model_probs.values()) - min(model_probs.values()) > 0.8) or \
-               (m_h > 0.7 and l_total > (margin + 1.5)):
-                magic_triggered, is_ai = True, True
+            # Suspicion Window logic
+            is_suspicious = abs(l_final - margin) < window
+            
+            # Magic Tool Logic (Extracted but disabled for now)
+            # magic_triggered = should_use_magic_tool(px, l_final, margin, window, model_probs, m_h)
+            # if magic_triggered: is_ai = True
+            magic_triggered = False 
             
             final_batch_results.append({
-                "ai_score": float(torch.sigmoid(torch.tensor(l_total)).item()),
+                "ai_score": float(torch.sigmoid(torch.tensor(l_final)).item()),
                 "is_ai": bool(is_ai),
+                "suspicious": bool(is_suspicious),
                 "magic_triggered": magic_triggered,
                 "slice": slice_name,
                 "breakdown": model_probs,
-                "metadata_h": m_h
+                "metadata_h": m_h,
+                "metadata_ai": m_ai
             })
         return final_batch_results
 
