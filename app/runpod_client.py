@@ -6,9 +6,39 @@ import logging
 import io
 import time
 from PIL import Image
+import json
+import tempfile
+from pathlib import Path
 from typing import Dict, Any, Union
 
 logger = logging.getLogger(__name__)
+
+# Shared disk buffer for multi-process webhook handling (Railway fix)
+WEBHOOK_BUFFER_DIR = Path(tempfile.gettempdir()) / "runpod_webhook_buffer"
+WEBHOOK_BUFFER_DIR.mkdir(parents=True, exist_ok=True)
+
+def buffer_result_to_disk(job_id: str, result: dict):
+    """Save result to disk so other processes can see it."""
+    try:
+        file_path = WEBHOOK_BUFFER_DIR / f"{job_id}.json"
+        with open(file_path, 'w') as f:
+            json.dump({"result": result, "timestamp": time.time()}, f)
+        logger.info(f"[DISK-BUFFER] Job {job_id} saved to disk")
+    except Exception as e:
+        logger.error(f"[DISK-BUFFER] Failed to write {job_id}: {e}")
+
+def get_buffered_result_from_disk(job_id: str):
+    """Check disk for a result saved by another process."""
+    file_path = WEBHOOK_BUFFER_DIR / f"{job_id}.json"
+    if file_path.exists():
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            file_path.unlink() # Delete after reading
+            return data.get("result")
+        except Exception as e:
+            logger.error(f"[DISK-BUFFER] Failed to read {job_id}: {e}")
+    return None
 
 # ---- Pending Jobs for Webhook Support ----
 # Format: {job_id: (asyncio.Future, start_time)}
@@ -48,6 +78,15 @@ def cleanup_stale_jobs():
     for job_id in stale_buffer:
         webhook_result_buffer.pop(job_id, None)
         logger.warning(f"[CLEANUP] Removed stale buffered result: {job_id}")
+
+    # Cleanup disk buffer
+    try:
+        for p in WEBHOOK_BUFFER_DIR.glob("*.json"):
+            if now - p.stat().st_mtime > WEBHOOK_BUFFER_TTL:
+                p.unlink()
+                logger.warning(f"[CLEANUP] Removed stale disk result: {p.name}")
+    except Exception as e:
+        logger.error(f"[CLEANUP] Disk buffer cleanup error: {e}")
 
 def get_config():
     return {
@@ -320,11 +359,19 @@ async def _run_with_webhook(endpoint, payload: dict, webhook_url: str, timeout_s
     pending_jobs[job_id] = (future, start_time)
     
     # Check if webhook already arrived (race condition fix)
+    # 1. Check local memory
     if job_id in webhook_result_buffer:
         result, _ = webhook_result_buffer.pop(job_id)
         elapsed_ms = (time.time() - start_time) * 1000
-        logger.info(f"[WEBHOOK] Job {job_id} found in buffer (arrived early) in {elapsed_ms:.2f}ms")
+        logger.info(f"[WEBHOOK] Job {job_id} found in local memory (arrived early) in {elapsed_ms:.2f}ms")
         return result
+    
+    # 2. Check disk (multi-process fix)
+    disk_result = get_buffered_result_from_disk(job_id)
+    if disk_result:
+        elapsed_ms = (time.time() - start_time) * 1000
+        logger.info(f"[WEBHOOK] Job {job_id} found on disk (arrived early at another worker) in {elapsed_ms:.2f}ms")
+        return disk_result
     
     try:
         # Wait for webhook with periodic buffer checks (race condition fix)
@@ -354,21 +401,26 @@ async def _run_with_webhook(endpoint, payload: dict, webhook_url: str, timeout_s
 
 async def _wait_with_buffer_check(future: asyncio.Future, job_id: str, timeout_seconds: int):
     """
-    Wait for future with periodic buffer checks to handle race conditions.
-    Checks buffer every 100ms in case webhook arrived but future wasn't set.
+    Wait for future with periodic buffer checks (Memory and Disk).
     """
     deadline = time.time() + timeout_seconds
     
     while time.time() < deadline:
-        # Check if future is resolved
+        # 1. Check if future is resolved (This process received it)
         if future.done():
             return future.result()
         
-        # Check buffer (race condition: webhook arrived before pending_jobs was checked)
+        # 2. Check local memory buffer
         if job_id in webhook_result_buffer:
             result, _ = webhook_result_buffer.pop(job_id)
-            logger.info(f"[WEBHOOK] Job {job_id} found in buffer during wait")
+            logger.info(f"[WEBHOOK] Job {job_id} found in local memory")
             return result
+        
+        # 3. Check disk buffer (Another process received it)
+        disk_result = get_buffered_result_from_disk(job_id)
+        if disk_result:
+            logger.info(f"[WEBHOOK] Job {job_id} found on disk (received by another worker)")
+            return disk_result
         
         # Wait a bit before next check
         try:

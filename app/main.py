@@ -169,9 +169,12 @@ async def runpod_webhook(request: Request):
                 return {"status": "acknowledged"}
         elif job_id and status == "COMPLETED" and output:
             # Buffer for race conditions (webhook arrives before job is tracked)
+            # OR multi-process scenarios (webhook arrives at different worker)
             if isinstance(output, dict):
                 webhook_result_buffer[job_id] = (output, time.time())
-                logger.info(f"[WEBHOOK] Job {job_id} buffered (Early arrival)")
+                from app.runpod_client import buffer_result_to_disk
+                buffer_result_to_disk(job_id, output)
+                logger.info(f"[WEBHOOK] Job {job_id} buffered (Early arrival saved to disk)")
             else:
                 logger.warning(f"[WEBHOOK] Job {job_id} has non-dict output, ignoring buffer: {type(output)}")
         
