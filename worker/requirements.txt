@@ -3,10 +3,3 @@ transformers==4.48.3
 accelerate
 safetensors
 Pillow
-timm
-numpy<2
-<<<<<<< HEAD
-yacs
-matplotlib
-=======
->>>>>>> 55b8f71 (empty commit)
